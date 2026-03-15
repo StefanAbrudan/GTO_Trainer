@@ -402,8 +402,10 @@ function analyzeDraws(holeCards: Card[], boardCards: Card[]): string[] {
 }
 
 // ── Action Feedback ─────────────────────────────────────────────
+type FeedbackRating = "perfect" | "good" | "bad";
+
 interface ActionFeedback {
-  correct: boolean;
+  rating: FeedbackRating;
   yourAction: string;
   gtoAction: string;
   explanation: string;
@@ -482,24 +484,97 @@ function getGTORecommendation(
   return { action: "Check", explanation: `Marginal hand (${handEval.description}). Check is standard.` };
 }
 
-function isActionCorrect(heroAction: string, gtoRec: string): boolean {
+function rateAction(
+  heroAction: string,
+  gtoRec: string,
+  street: Street,
+  handStrength: number,
+  hasDraws: boolean,
+  facingBet: boolean,
+  gtoFrequency?: number,
+): FeedbackRating {
   const ha = heroAction.toLowerCase();
   const gr = gtoRec.toLowerCase();
 
-  if (ha === "fold" && gr === "fold") return true;
-  if (ha === "check" && gr === "check") return true;
-  if (ha === "call" && gr === "call") return true;
+  // Categorize actions
+  const heroCategory = ha === "fold" ? "fold"
+    : ha === "check" ? "check"
+    : ha === "call" ? "call"
+    : (ha.startsWith("bet") || ha.startsWith("raise") || ha === "all-in") ? "aggressive" : "unknown";
 
-  // Bet/raise actions match bet/raise recommendations
-  const heroIsBetOrRaise = ha.startsWith("bet") || ha.startsWith("raise") || ha === "all-in";
-  const gtoIsBetOrRaise = gr.startsWith("bet") || gr.startsWith("raise");
+  const gtoCategory = gr === "fold" ? "fold"
+    : gr === "check" ? "check"
+    : gr === "call" ? "call"
+    : (gr.startsWith("bet") || gr.startsWith("raise")) ? "aggressive" : "unknown";
 
-  if (heroIsBetOrRaise && gtoIsBetOrRaise) return true;
+  // ── PERFECT: Exact match ──
+  if (heroCategory === gtoCategory) return "perfect";
 
-  // All-in matches raise/bet for strong hands
-  if (ha === "all-in" && gtoIsBetOrRaise) return true;
+  // Preflop: use frequency for mixed spots
+  if (street === "preflop" && gtoFrequency !== undefined) {
+    // Mixed spot (frequency 20-80%) — aggressive or fold are both acceptable
+    if (gtoFrequency >= 20 && gtoFrequency <= 80) {
+      if (heroCategory === "aggressive" || heroCategory === "fold") return "good";
+    }
+    // Strong raise spot but hero folded = bad
+    if (gtoFrequency >= 80 && heroCategory === "fold") return "bad";
+    // Clear fold but hero raised = bad
+    if (gtoFrequency < 15 && heroCategory === "aggressive") return "bad";
+  }
 
-  return false;
+  // ── GOOD: Acceptable alternative ──
+
+  // Calling when GTO says raise (not terrible, just passive)
+  if (heroCategory === "call" && gtoCategory === "aggressive") {
+    if (handStrength >= 2) return "good"; // decent hand, calling is ok
+    return "bad"; // bluffing spot, calling makes no sense
+  }
+
+  // Betting/raising when GTO says call (being aggressive with a calling hand)
+  if (heroCategory === "aggressive" && gtoCategory === "call") {
+    if (handStrength >= 3) return "good"; // strong hand, raising for value is fine
+    if (hasDraws) return "good"; // semi-bluff is acceptable
+    return "bad"; // turning a bluff-catcher into a bluff
+  }
+
+  // Checking when GTO says bet small (missed a thin value bet, not terrible)
+  if (heroCategory === "check" && gtoCategory === "aggressive") {
+    if (handStrength >= 4) return "bad"; // missing big value = bad
+    if (handStrength >= 2) return "good"; // missing thin value = ok
+    return "good"; // was a bluff anyway, checking is fine
+  }
+
+  // Betting when GTO says check
+  if (heroCategory === "aggressive" && gtoCategory === "check") {
+    if (handStrength >= 3) return "good"; // betting a decent hand for value
+    if (hasDraws) return "good"; // semi-bluff
+    if (handStrength < 1) return "good"; // turning air into a bluff (could go either way)
+    return "bad"; // betting a medium hand turns it into a bluff
+  }
+
+  // Calling when GTO says fold (burning money)
+  if (heroCategory === "call" && gtoCategory === "fold") {
+    if (hasDraws) return "good"; // calling with draws has some merit
+    return "bad";
+  }
+
+  // Folding when GTO says call (too tight)
+  if (heroCategory === "fold" && gtoCategory === "call") {
+    if (handStrength < 1.5 && !hasDraws) return "good"; // borderline fold
+    return "bad";
+  }
+
+  // Folding when GTO says bet/raise (folding a strong hand)
+  if (heroCategory === "fold" && gtoCategory === "aggressive") {
+    if (!facingBet) return "bad"; // folding when nobody bet?!
+    if (handStrength >= 2) return "bad"; // folding a playable hand
+    return "bad";
+  }
+
+  // Raising when GTO says fold
+  if (heroCategory === "aggressive" && gtoCategory === "fold") return "bad";
+
+  return "bad";
 }
 
 // ── Scenario Types ──────────────────────────────────────────────
@@ -1294,6 +1369,44 @@ function BoardTexturePanel({ boardTexture, draws, handEval }: {
 }
 
 // ── Feedback Banner ─────────────────────────────────────────────────
+const RATING_CONFIG: Record<FeedbackRating, {
+  label: string;
+  border: string;
+  bg: string;
+  icon: string;
+  iconColor: string;
+  labelColor: string;
+  gtoColor: string;
+}> = {
+  perfect: {
+    label: "Perfect",
+    border: "border-emerald-500",
+    bg: "bg-emerald-950/60",
+    icon: "\u2713",
+    iconColor: "text-emerald-400",
+    labelColor: "text-emerald-400",
+    gtoColor: "text-emerald-400",
+  },
+  good: {
+    label: "Good",
+    border: "border-yellow-500",
+    bg: "bg-yellow-950/40",
+    icon: "~",
+    iconColor: "text-yellow-400",
+    labelColor: "text-yellow-400",
+    gtoColor: "text-yellow-400",
+  },
+  bad: {
+    label: "Bad",
+    border: "border-red-500",
+    bg: "bg-red-950/60",
+    icon: "\u2717",
+    iconColor: "text-red-400",
+    labelColor: "text-red-400",
+    gtoColor: "text-red-400",
+  },
+};
+
 function FeedbackBanner({
   feedback,
   onDismiss,
@@ -1301,18 +1414,18 @@ function FeedbackBanner({
   feedback: ActionFeedback;
   onDismiss: () => void;
 }) {
-  const borderColor = feedback.correct ? "border-emerald-500" : "border-red-500";
-  const bgColor = feedback.correct ? "bg-emerald-950/60" : "bg-red-950/60";
-  const icon = feedback.correct ? "\u2713" : "\u2717";
-  const iconColor = feedback.correct ? "text-emerald-400" : "text-red-400";
+  const cfg = RATING_CONFIG[feedback.rating];
 
   return (
     <div
       onClick={onDismiss}
-      className={`mx-4 mb-1 rounded-xl border-l-4 ${borderColor} ${bgColor} px-4 py-3 cursor-pointer transition-all animate-fade-in`}
+      className={`mx-4 mb-1 rounded-xl border-l-4 ${cfg.border} ${cfg.bg} px-4 py-3 cursor-pointer transition-all animate-fade-in`}
     >
       <div className="flex items-start gap-3">
-        <span className={`text-2xl font-black ${iconColor} leading-none mt-0.5`}>{icon}</span>
+        <div className="flex flex-col items-center gap-0.5">
+          <span className={`text-2xl font-black ${cfg.iconColor} leading-none`}>{cfg.icon}</span>
+          <span className={`text-[10px] font-black uppercase tracking-wider ${cfg.labelColor}`}>{cfg.label}</span>
+        </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-3 flex-wrap mb-1">
             <span className="text-xs text-gray-400">
@@ -1320,11 +1433,11 @@ function FeedbackBanner({
             </span>
             <span className="text-gray-600 text-xs">|</span>
             <span className="text-xs text-gray-400">
-              GTO recommends: <span className={`font-bold ${feedback.correct ? "text-emerald-400" : "text-yellow-400"}`}>{feedback.gtoAction}</span>
+              GTO recommends: <span className={`font-bold ${cfg.gtoColor}`}>{feedback.gtoAction}</span>
             </span>
           </div>
           <p className="text-[11px] text-gray-400 leading-snug">{feedback.explanation}</p>
-          <span className="text-[9px] text-gray-600 uppercase tracking-wider">{feedback.street} &middot; click to dismiss</span>
+          <span className="text-[9px] text-gray-600 uppercase tracking-wider">{feedback.street} · click to dismiss</span>
         </div>
       </div>
     </div>
@@ -1476,27 +1589,29 @@ function ResultScreen({
           <div className="mb-4">
             <div className="text-xs text-gray-500 font-semibold mb-2 uppercase tracking-wider">Action Log with GTO Feedback</div>
             <div className="max-h-40 overflow-y-auto space-y-1 scrollbar-thin">
-              {actionFeedbacks.map((fb, i) => (
-                <div
-                  key={i}
-                  className={`flex items-start gap-2 rounded-lg px-3 py-1.5 border-l-2 ${
-                    fb.correct ? "border-emerald-500 bg-emerald-950/20" : "border-red-500 bg-red-950/20"
-                  }`}
-                >
-                  <span className={`text-sm font-black leading-none mt-0.5 ${fb.correct ? "text-emerald-400" : "text-red-400"}`}>
-                    {fb.correct ? "\u2713" : "\u2717"}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 text-[10px]">
-                      <span className="text-gray-500 uppercase font-bold">{fb.street}</span>
-                      <span className="text-gray-400">You: <span className="text-white font-semibold">{fb.yourAction}</span></span>
-                      <span className="text-gray-600">|</span>
-                      <span className="text-gray-400">GTO: <span className={`font-semibold ${fb.correct ? "text-emerald-400" : "text-yellow-400"}`}>{fb.gtoAction}</span></span>
+              {actionFeedbacks.map((fb, i) => {
+                const cfg = RATING_CONFIG[fb.rating];
+                return (
+                  <div
+                    key={i}
+                    className={`flex items-start gap-2 rounded-lg px-3 py-1.5 border-l-2 ${cfg.border} ${cfg.bg}`}
+                  >
+                    <div className="flex flex-col items-center min-w-[32px]">
+                      <span className={`text-sm font-black leading-none ${cfg.iconColor}`}>{cfg.icon}</span>
+                      <span className={`text-[7px] font-black uppercase ${cfg.labelColor}`}>{cfg.label}</span>
                     </div>
-                    <p className="text-[9px] text-gray-500 leading-tight mt-0.5">{fb.explanation}</p>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 text-[10px]">
+                        <span className="text-gray-500 uppercase font-bold">{fb.street}</span>
+                        <span className="text-gray-400">You: <span className="text-white font-semibold">{fb.yourAction}</span></span>
+                        <span className="text-gray-600">|</span>
+                        <span className="text-gray-400">GTO: <span className={`font-semibold ${cfg.gtoColor}`}>{fb.gtoAction}</span></span>
+                      </div>
+                      <p className="text-[9px] text-gray-500 leading-tight mt-0.5">{fb.explanation}</p>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -2006,9 +2121,24 @@ export default function TrainerPage() {
     if (action === "raise" && amount) heroActionDisplay = `Raise ${amount.toFixed(1)}`;
     if (action === "allin") heroActionDisplay = "All-in";
 
-    const actionCorrect = isActionCorrect(heroActionDisplay, gtoRec.action);
+    // Compute hand strength & draws for rating
+    const evalForRating = evaluateHand(h.heroCards, h.visibleBoard);
+    const drawsForRating = analyzeDraws(h.heroCards, h.visibleBoard);
+    const hasDrawsForRating = drawsForRating.some((d) =>
+      d.toLowerCase().includes("flush draw") || d.toLowerCase().includes("open-ended") || d.toLowerCase().includes("gutshot")
+    );
+
+    const actionRating = rateAction(
+      heroActionDisplay,
+      gtoRec.action,
+      h.street,
+      evalForRating.strength,
+      hasDrawsForRating,
+      h.facingBet,
+      h.street === "preflop" ? h.gtoFrequency : undefined,
+    );
     const feedback: ActionFeedback = {
-      correct: actionCorrect,
+      rating: actionRating,
       yourAction: heroActionDisplay,
       gtoAction: gtoRec.action,
       explanation: gtoRec.explanation,
@@ -2032,22 +2162,22 @@ export default function TrainerPage() {
       const invested = h.startingStack - h.stacks[h.heroPosition];
       h.bbWon = -invested;
 
-      // Track preflop accuracy
+      // Track preflop accuracy using rating
       setSessionStats((prev) => {
         const newStats = { ...prev };
         newStats.total += 1;
-        const preflopCorrect = h.gtoAction === "Fold";
-        newStats.correct += preflopCorrect ? 1 : 0;
-        newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
+        const isCorrect = actionRating !== "bad";
+        newStats.correct += isCorrect ? 1 : 0;
+        newStats.streak = isCorrect ? prev.streak + 1 : 0;
         newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
         newStats.handsLost += 1;
         newStats.totalBBWon += h.bbWon;
         newStats.perPosition = { ...prev.perPosition };
         newStats.perPosition[h.heroPosition] = {
-          correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+          correct: prev.perPosition[h.heroPosition].correct + (isCorrect ? 1 : 0),
           total: prev.perPosition[h.heroPosition].total + 1,
         };
-        if (!preflopCorrect) {
+        if (actionRating === "bad") {
           newStats.mistakes = [...prev.mistakes, {
             handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
             yourAction: "Fold", gtoAction: h.gtoAction,
@@ -2137,20 +2267,19 @@ export default function TrainerPage() {
       h.facingBet = false;
 
       if (h.street === "preflop") {
-        // Preflop raise - track accuracy
-        const preflopCorrect = h.gtoAction === "Raise" || h.gtoAction === "Allin";
+        const isCorrect = actionRating !== "bad";
         setSessionStats((prev) => {
           const newStats = { ...prev };
           newStats.perPosition = { ...prev.perPosition };
           newStats.perPosition[h.heroPosition] = {
-            correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+            correct: prev.perPosition[h.heroPosition].correct + (isCorrect ? 1 : 0),
             total: prev.perPosition[h.heroPosition].total + 1,
           };
-          newStats.correct += preflopCorrect ? 1 : 0;
+          newStats.correct += isCorrect ? 1 : 0;
           newStats.total += 1;
-          newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
+          newStats.streak = isCorrect ? prev.streak + 1 : 0;
           newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
-          if (!preflopCorrect) {
+          if (actionRating === "bad") {
             newStats.mistakes = [...prev.mistakes, {
               handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
               yourAction: "Raise", gtoAction: h.gtoAction,
@@ -2180,19 +2309,19 @@ export default function TrainerPage() {
       h.facingBet = false;
 
       if (h.street === "preflop") {
-        const preflopCorrect = h.gtoAction === "Raise" || h.gtoAction === "Allin";
+        const isCorrect = actionRating !== "bad";
         setSessionStats((prev) => {
           const newStats = { ...prev };
           newStats.perPosition = { ...prev.perPosition };
           newStats.perPosition[h.heroPosition] = {
-            correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+            correct: prev.perPosition[h.heroPosition].correct + (isCorrect ? 1 : 0),
             total: prev.perPosition[h.heroPosition].total + 1,
           };
-          newStats.correct += preflopCorrect ? 1 : 0;
+          newStats.correct += isCorrect ? 1 : 0;
           newStats.total += 1;
-          newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
+          newStats.streak = isCorrect ? prev.streak + 1 : 0;
           newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
-          if (!preflopCorrect) {
+          if (actionRating === "bad") {
             newStats.mistakes = [...prev.mistakes, {
               handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
               yourAction: "All-in", gtoAction: h.gtoAction,
