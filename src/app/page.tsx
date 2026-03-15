@@ -1,65 +1,145 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { loadProgress, getAccuracy, UserProgress } from "@/lib/progress";
+import { CHAPTERS } from "@/data/gto-concepts";
+import { QUIZ_QUESTIONS } from "@/data/quiz-questions";
 
 export default function Home() {
+  const [progress, setProgress] = useState<UserProgress | null>(null);
+
+  useEffect(() => {
+    setProgress(loadProgress());
+  }, []);
+
+  const accuracy = progress ? getAccuracy(progress) : 0;
+  const totalAnswered = progress?.totalQuestions || 0;
+  const streak = progress?.streakDays || 0;
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <div className="space-y-8 animate-fade-in">
+      {/* Hero */}
+      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-emerald-900/40 via-gray-900 to-blue-900/40 border border-gray-800 p-8">
+        <div className="relative z-10">
+          <h1 className="text-4xl font-black text-white mb-2">
+            GTO <span className="text-emerald-400">Trainer</span>
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+          <p className="text-gray-400 text-lg max-w-xl mb-6">
+            Master Game Theory Optimal poker strategy with interactive quizzes, range analysis,
+            equity calculations, and spaced repetition learning.
           </p>
+          <div className="flex gap-3">
+            <Link
+              href="/trainer"
+              className="px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all shadow-lg shadow-emerald-600/20 animate-pulse-glow"
+            >
+              Start Training
+            </Link>
+            <Link
+              href="/quiz"
+              className="px-6 py-3 bg-gray-800 hover:bg-gray-700 text-white font-medium rounded-xl transition-all border border-gray-700"
+            >
+              Quick Quiz
+            </Link>
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+        {/* Decorative cards */}
+        <div className="absolute right-8 top-6 opacity-20 text-8xl font-black text-white select-none">
+          A♠
         </div>
-      </main>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div className="text-3xl font-black text-white">{totalAnswered}</div>
+          <div className="text-sm text-gray-400">Questions Answered</div>
+        </div>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div className="text-3xl font-black text-emerald-400">{accuracy}%</div>
+          <div className="text-sm text-gray-400">Accuracy</div>
+        </div>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div className="text-3xl font-black text-orange-400">{streak}</div>
+          <div className="text-sm text-gray-400">Day Streak</div>
+        </div>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div className="text-3xl font-black text-blue-400">{QUIZ_QUESTIONS.length}</div>
+          <div className="text-sm text-gray-400">Total Questions</div>
+        </div>
+      </div>
+
+      {/* Quick Actions */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <Link
+          href="/trainer"
+          className="group bg-gray-900 border border-gray-800 hover:border-emerald-700 rounded-xl p-5 transition-all"
+        >
+          <div className="text-2xl mb-2">🎯</div>
+          <h3 className="text-white font-bold group-hover:text-emerald-400 transition-colors">
+            GTO Trainer
+          </h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Spaced repetition training with questions tailored to your skill level and weak spots.
+          </p>
+        </Link>
+        <Link
+          href="/ranges"
+          className="group bg-gray-900 border border-gray-800 hover:border-blue-700 rounded-xl p-5 transition-all"
+        >
+          <div className="text-2xl mb-2">🃏</div>
+          <h3 className="text-white font-bold group-hover:text-blue-400 transition-colors">
+            Range Viewer
+          </h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Explore GTO opening ranges, 3-bet ranges, and more for every position.
+          </p>
+        </Link>
+        <Link
+          href="/calculator"
+          className="group bg-gray-900 border border-gray-800 hover:border-purple-700 rounded-xl p-5 transition-all"
+        >
+          <div className="text-2xl mb-2">🧮</div>
+          <h3 className="text-white font-bold group-hover:text-purple-400 transition-colors">
+            EV Calculator
+          </h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Calculate pot odds, MDF, EV, geometric sizing, and bluff frequencies.
+          </p>
+        </Link>
+      </div>
+
+      {/* Chapters */}
+      <div>
+        <h2 className="text-xl font-bold text-white mb-4">Learning Chapters</h2>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {CHAPTERS.map((ch) => {
+            const cp = progress?.chapterProgress[ch.id];
+            const answered = cp?.total || 0;
+
+            return (
+              <Link
+                key={ch.id}
+                href={`/lessons?chapter=${ch.id}`}
+                className="bg-gray-900 border border-gray-800 hover:border-gray-600 rounded-xl p-4 transition-all group"
+              >
+                <div className="text-2xl mb-2">{ch.icon}</div>
+                <h3 className="text-white font-bold text-sm group-hover:text-emerald-400 transition-colors">
+                  {ch.title}
+                </h3>
+                <p className="text-xs text-gray-500 mt-1 line-clamp-2">{ch.description}</p>
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-xs text-gray-600">{ch.lessonCount} lessons</span>
+                  {answered > 0 && (
+                    <span className="text-xs text-emerald-500">{answered} answered</span>
+                  )}
+                </div>
+              </Link>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }
