@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import PokerTable, { Card, PlayerSeat } from "@/components/PokerTable";
 import {
   PREFLOP_RANGES,
@@ -9,7 +9,6 @@ import {
   getHandKey,
   getFrequencyColor,
   isPair,
-  isSuited,
   adjustRangeForStack,
   RangeData,
 } from "@/data/preflop-ranges";
@@ -25,6 +24,14 @@ const STACK_DEPTHS = [20, 30, 40, 60, 100, 200] as const;
 type StackDepth = (typeof STACK_DEPTHS)[number];
 
 type SpotType = "RFI" | "3-Bet" | "vs3Bet";
+type Street = "preflop" | "flop" | "turn" | "river";
+type StartingStreet = "preflop" | "flop" | "turn" | "river";
+type SpeedMode = "normal" | "fast";
+
+// ── Hand rank constants ──────────────────────────────────────────
+const RANK_VALUES: Record<string, number> = {
+  A: 14, K: 13, Q: 12, J: 11, T: 10, "9": 9, "8": 8, "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2,
+};
 
 // ── Settings ──────────────────────────────────────────────────────
 interface TrainerSettings {
@@ -32,6 +39,8 @@ interface TrainerSettings {
   stackDepth: StackDepth;
   blinds: string;
   spotTypes: Record<SpotType, boolean>;
+  startingStreet: StartingStreet;
+  speed: SpeedMode;
 }
 
 const DEFAULT_SETTINGS: TrainerSettings = {
@@ -39,6 +48,8 @@ const DEFAULT_SETTINGS: TrainerSettings = {
   stackDepth: 100,
   blinds: "0.5/1",
   spotTypes: { RFI: true, "3-Bet": true, vs3Bet: false },
+  startingStreet: "preflop",
+  speed: "normal",
 };
 
 // ── Session Stats ─────────────────────────────────────────────────
@@ -54,12 +65,15 @@ interface SessionStats {
   bestStreak: number;
   perPosition: Record<Position, PositionStats>;
   mistakes: { handKey: string; position: string; scenario: string; yourAction: string; gtoAction: string }[];
+  handsWon: number;
+  handsLost: number;
+  totalBBWon: number;
 }
 
 function emptySessionStats(): SessionStats {
   const perPos = {} as Record<Position, PositionStats>;
   for (const p of POSITIONS) perPos[p] = { correct: 0, total: 0 };
-  return { correct: 0, total: 0, streak: 0, bestStreak: 0, perPosition: perPos, mistakes: [] };
+  return { correct: 0, total: 0, streak: 0, bestStreak: 0, perPosition: perPos, mistakes: [], handsWon: 0, handsLost: 0, totalBBWon: 0 };
 }
 
 // ── Deck helpers ───────────────────────────────────────────────────
@@ -89,32 +103,352 @@ function cardsToHandKey(c1: Card, c2: Card): string {
   return `${higher.rank}${lower.rank}${suited}`;
 }
 
-// ── Scenario ─────────────────────────────────────────────────────
-interface Scenario {
-  heroPosition: Position;
-  heroCards: [Card, Card];
-  boardCards: Card[];
-  players: PlayerSeat[];
-  actionHistory: ActionEntry[];
-  potSize: number;
-  gtoAction: "Fold" | "Call" | "Raise" | "Allin";
-  gtoFrequency: number;
-  handKey: string;
-  rangeScenario: string;
-  street: "preflop" | "flop" | "turn" | "river";
-  facingAction: string;
-  spotType: SpotType;
-  rangeGrid: Record<string, number>; // the full range for this spot
-  raiserPosition?: string; // position of the original raiser (for 3-bet spots)
-  callFrequency: number;
-  foldFrequency: number;
-  explanation: string;
+// ── Hand Evaluation ──────────────────────────────────────────────
+type HandRank = "High Card" | "Pair" | "Two Pair" | "Three of a Kind" | "Straight" | "Flush" | "Full House" | "Four of a Kind" | "Straight Flush";
+
+interface HandEvaluation {
+  rank: HandRank;
+  description: string;
+  strength: number; // 0-9 scale
 }
 
+function evaluateHand(holeCards: Card[], boardCards: Card[]): HandEvaluation {
+  const allCards = [...holeCards, ...boardCards];
+  if (allCards.length < 2) return { rank: "High Card", description: "High card", strength: 0 };
+
+  const values = allCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+  const suits = allCards.map((c) => c.suit);
+  const holeValues = holeCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+
+  // Count occurrences
+  const valueCounts: Record<number, number> = {};
+  for (const v of values) valueCounts[v] = (valueCounts[v] || 0) + 1;
+
+  // Check flush
+  const suitCounts: Record<string, number> = {};
+  for (const s of suits) suitCounts[s] = (suitCounts[s] || 0) + 1;
+  const flushSuit = Object.entries(suitCounts).find(([, c]) => c >= 5)?.[0];
+  const isFlush = !!flushSuit;
+
+  // Check straight
+  const uniqueVals = [...new Set(values)].sort((a, b) => b - a);
+  let isStraight = false;
+  let straightHigh = 0;
+  for (let i = 0; i <= uniqueVals.length - 5; i++) {
+    if (uniqueVals[i] - uniqueVals[i + 4] === 4) {
+      isStraight = true;
+      straightHigh = uniqueVals[i];
+      break;
+    }
+  }
+  // Check A-2-3-4-5 straight (wheel)
+  if (!isStraight && uniqueVals.includes(14) && uniqueVals.includes(2) && uniqueVals.includes(3) && uniqueVals.includes(4) && uniqueVals.includes(5)) {
+    isStraight = true;
+    straightHigh = 5;
+  }
+
+  // Check straight flush
+  if (isFlush && isStraight) {
+    const flushCards = allCards.filter((c) => c.suit === flushSuit);
+    const flushVals = [...new Set(flushCards.map((c) => RANK_VALUES[c.rank]))].sort((a, b) => b - a);
+    let isStraightFlush = false;
+    for (let i = 0; i <= flushVals.length - 5; i++) {
+      if (flushVals[i] - flushVals[i + 4] === 4) {
+        isStraightFlush = true;
+        break;
+      }
+    }
+    if (!isStraightFlush && flushVals.includes(14) && flushVals.includes(2) && flushVals.includes(3) && flushVals.includes(4) && flushVals.includes(5)) {
+      isStraightFlush = true;
+    }
+    if (isStraightFlush) {
+      return { rank: "Straight Flush", description: `Straight flush`, strength: 9 };
+    }
+  }
+
+  const counts = Object.values(valueCounts).sort((a, b) => b - a);
+
+  // Four of a kind
+  if (counts[0] === 4) {
+    const quadVal = Number(Object.entries(valueCounts).find(([, c]) => c === 4)![0]);
+    const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === quadVal)?.[0] || "";
+    return { rank: "Four of a Kind", description: `Quad ${rankName}s`, strength: 8 };
+  }
+
+  // Full house
+  if (counts[0] === 3 && counts[1] >= 2) {
+    const tripVal = Number(Object.entries(valueCounts).find(([, c]) => c === 3)![0]);
+    const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === tripVal)?.[0] || "";
+    return { rank: "Full House", description: `Full house, ${rankName}s full`, strength: 7 };
+  }
+
+  // Flush
+  if (isFlush) {
+    const heroFlushCards = holeCards.filter((c) => c.suit === flushSuit);
+    if (heroFlushCards.length > 0) {
+      const highFlush = Math.max(...heroFlushCards.map((c) => RANK_VALUES[c.rank]));
+      if (highFlush === 14) return { rank: "Flush", description: "Nut flush", strength: 6.5 };
+      const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === highFlush)?.[0] || "";
+      return { rank: "Flush", description: `${rankName}-high flush`, strength: 6 };
+    }
+    return { rank: "Flush", description: "Board flush", strength: 5.5 };
+  }
+
+  // Straight
+  if (isStraight) {
+    const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === straightHigh)?.[0] || "";
+    return { rank: "Straight", description: `${rankName}-high straight`, strength: 5 };
+  }
+
+  // Three of a kind
+  if (counts[0] === 3) {
+    const tripVal = Number(Object.entries(valueCounts).find(([, c]) => c === 3)![0]);
+    const heroHasTrip = holeValues.includes(tripVal);
+    const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === tripVal)?.[0] || "";
+    return {
+      rank: "Three of a Kind",
+      description: heroHasTrip ? `Trip ${rankName}s (set)` : `Trip ${rankName}s`,
+      strength: 4,
+    };
+  }
+
+  // Two pair
+  if (counts[0] === 2 && counts[1] === 2) {
+    const pairVals = Object.entries(valueCounts)
+      .filter(([, c]) => c === 2)
+      .map(([v]) => Number(v))
+      .sort((a, b) => b - a);
+    const high = Object.entries(RANK_VALUES).find(([, v]) => v === pairVals[0])?.[0] || "";
+    const low = Object.entries(RANK_VALUES).find(([, v]) => v === pairVals[1])?.[0] || "";
+    return { rank: "Two Pair", description: `Two pair, ${high}s and ${low}s`, strength: 3 };
+  }
+
+  // One pair
+  if (counts[0] === 2) {
+    const pairVal = Number(Object.entries(valueCounts).find(([, c]) => c === 2)![0]);
+    const rankName = Object.entries(RANK_VALUES).find(([, v]) => v === pairVal)?.[0] || "";
+    const boardValues = boardCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+    const heroHasPair = holeValues.includes(pairVal);
+
+    if (heroHasPair && boardValues.length > 0) {
+      if (pairVal > boardValues[0]) {
+        return { rank: "Pair", description: `Overpair (${rankName}${rankName})`, strength: 2.8 };
+      } else if (pairVal === boardValues[0]) {
+        const kicker = holeValues.find((v) => v !== pairVal) || 0;
+        const kickerName = Object.entries(RANK_VALUES).find(([, v]) => v === kicker)?.[0] || "";
+        return { rank: "Pair", description: `Top pair, ${kickerName} kicker`, strength: 2.5 };
+      } else if (boardValues.length >= 2 && pairVal === boardValues[1]) {
+        return { rank: "Pair", description: `Middle pair (${rankName}s)`, strength: 2 };
+      } else {
+        return { rank: "Pair", description: `Bottom pair (${rankName}s)`, strength: 1.5 };
+      }
+    }
+    // Pocket pair below board or board pair
+    if (holeValues[0] === holeValues[1] && holeValues[0] === pairVal) {
+      return { rank: "Pair", description: `Pocket ${rankName}s`, strength: 2 };
+    }
+    return { rank: "Pair", description: `Pair of ${rankName}s`, strength: 1.5 };
+  }
+
+  // High card
+  const highRank = Object.entries(RANK_VALUES).find(([, v]) => v === holeValues[0])?.[0] || "";
+  return { rank: "High Card", description: `${highRank} high`, strength: 0.5 };
+}
+
+// ── Board Texture Analysis ──────────────────────────────────────
+interface BoardTexture {
+  type: "Dry" | "Semi-wet" | "Wet";
+  flushDraw: boolean;
+  flushComplete: boolean;
+  straightDraw: boolean;
+  straightComplete: boolean;
+  paired: boolean;
+  advice: string;
+  cbetFrequency: string;
+}
+
+function analyzeBoardTexture(boardCards: Card[]): BoardTexture {
+  if (boardCards.length === 0) {
+    return { type: "Dry", flushDraw: false, flushComplete: false, straightDraw: false, straightComplete: false, paired: false, advice: "", cbetFrequency: "" };
+  }
+
+  const suits = boardCards.map((c) => c.suit);
+  const values = boardCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+
+  // Suit analysis
+  const suitCounts: Record<string, number> = {};
+  for (const s of suits) suitCounts[s] = (suitCounts[s] || 0) + 1;
+  const maxSuitCount = Math.max(...Object.values(suitCounts));
+  const flushDraw = maxSuitCount >= 2 && maxSuitCount < 5;
+  const flushComplete = maxSuitCount >= 5;
+  const monotone = maxSuitCount >= 3 && boardCards.length <= 3;
+  const twoTone = maxSuitCount === 2 && boardCards.length >= 3;
+
+  // Connectivity / straight analysis
+  const uniqueVals = [...new Set(values)].sort((a, b) => a - b);
+  let maxConnected = 1;
+  let currentRun = 1;
+  for (let i = 1; i < uniqueVals.length; i++) {
+    if (uniqueVals[i] - uniqueVals[i - 1] <= 2) {
+      currentRun++;
+      maxConnected = Math.max(maxConnected, currentRun);
+    } else {
+      currentRun = 1;
+    }
+  }
+  const straightDraw = maxConnected >= 3;
+
+  // Check for complete straights
+  let straightComplete = false;
+  if (uniqueVals.length >= 5) {
+    for (let i = 0; i <= uniqueVals.length - 5; i++) {
+      if (uniqueVals[i + 4] - uniqueVals[i] === 4) { straightComplete = true; break; }
+    }
+  }
+
+  // Paired board
+  const valueCounts: Record<number, number> = {};
+  for (const v of values) valueCounts[v] = (valueCounts[v] || 0) + 1;
+  const paired = Object.values(valueCounts).some((c) => c >= 2);
+
+  // Calculate wetness score
+  let wetness = 0;
+  if (monotone) wetness += 3;
+  else if (twoTone) wetness += 1;
+  if (maxConnected >= 4) wetness += 3;
+  else if (maxConnected >= 3) wetness += 2;
+  else if (maxConnected >= 2) wetness += 1;
+  if (values.filter((v) => v >= 8 && v <= 12).length >= 2) wetness += 1; // broadway heavy
+
+  let type: "Dry" | "Semi-wet" | "Wet";
+  let advice: string;
+  let cbetFrequency: string;
+
+  if (wetness <= 1) {
+    type = "Dry";
+    advice = "Dry board favors preflop aggressor. C-bet wide at small sizing.";
+    cbetFrequency = "C-bet ~75% of range at 33% pot";
+  } else if (wetness <= 3) {
+    type = "Semi-wet";
+    advice = "Semi-wet board. Be selective with c-bets, use medium sizing.";
+    cbetFrequency = "C-bet ~55% of range at 50-66% pot";
+  } else {
+    type = "Wet";
+    advice = "Wet/connected board. Check more, bet bigger when you do bet.";
+    cbetFrequency = "C-bet ~35% of range at 66-75% pot";
+  }
+
+  if (paired) {
+    advice += " Paired board reduces opponent's hit frequency.";
+  }
+
+  return { type, flushDraw, flushComplete, straightDraw, straightComplete, paired, advice, cbetFrequency };
+}
+
+// ── Draw Analysis ────────────────────────────────────────────────
+function analyzeDraws(holeCards: Card[], boardCards: Card[]): string[] {
+  const draws: string[] = [];
+  if (boardCards.length < 3) return draws;
+
+  const allCards = [...holeCards, ...boardCards];
+  const suitCounts: Record<string, number> = {};
+  for (const c of allCards) suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
+
+  // Flush draw check
+  for (const [suit, count] of Object.entries(suitCounts)) {
+    if (count === 4 && holeCards.some((c) => c.suit === suit)) {
+      const heroFlushCards = holeCards.filter((c) => c.suit === suit);
+      const highCard = Math.max(...heroFlushCards.map((c) => RANK_VALUES[c.rank]));
+      if (highCard === 14) draws.push("Nut flush draw");
+      else draws.push("Flush draw");
+    }
+  }
+
+  // Straight draw check (simplified)
+  const allValues = [...new Set(allCards.map((c) => RANK_VALUES[c.rank]))].sort((a, b) => a - b);
+  const heroValues = holeCards.map((c) => RANK_VALUES[c.rank]);
+
+  // Check for open-ended straight draws (4 in a row that include at least one hole card)
+  for (let start = 2; start <= 11; start++) {
+    const needed = [start, start + 1, start + 2, start + 3];
+    const have = needed.filter((v) => allValues.includes(v));
+    if (have.length === 4 && needed.some((v) => heroValues.includes(v))) {
+      draws.push("Open-ended straight draw");
+      break;
+    }
+  }
+
+  // Gutshot check
+  if (!draws.some((d) => d.includes("straight"))) {
+    for (let start = 1; start <= 10; start++) {
+      const needed = [start, start + 1, start + 2, start + 3, start + 4];
+      const have = needed.filter((v) => allValues.includes(v));
+      if (have.length === 4 && needed.some((v) => heroValues.includes(v))) {
+        draws.push("Gutshot straight draw");
+        break;
+      }
+    }
+  }
+
+  // Overcards
+  if (boardCards.length >= 3) {
+    const boardMax = Math.max(...boardCards.map((c) => RANK_VALUES[c.rank]));
+    const overCards = holeCards.filter((c) => RANK_VALUES[c.rank] > boardMax);
+    if (overCards.length === 2) draws.push("Two overcards");
+    else if (overCards.length === 1) draws.push("One overcard");
+  }
+
+  return draws;
+}
+
+// ── Scenario Types ──────────────────────────────────────────────
 interface ActionEntry {
   position: string;
   stack: number;
   action: string;
+  street?: Street;
+}
+
+interface HandState {
+  deck: Card[];
+  deckIndex: number;
+  heroPosition: Position;
+  heroCards: [Card, Card];
+  villainPosition: Position;
+  villainCards: [Card, Card];
+  boardCards: Card[]; // all 5 dealt (revealed progressively)
+  visibleBoard: Card[]; // currently visible community cards
+  players: PlayerSeat[];
+  stacks: Record<string, number>;
+  potSize: number;
+  street: Street;
+  actionHistory: ActionEntry[];
+  streetActions: Record<Street, ActionEntry[]>;
+  handKey: string;
+  spotType: SpotType;
+  rangeScenario: string;
+  rangeGrid: Record<string, number>;
+  raiserPosition?: string;
+  gtoAction: "Fold" | "Call" | "Raise" | "Allin";
+  gtoFrequency: number;
+  callFrequency: number;
+  foldFrequency: number;
+  explanation: string;
+  heroIsIP: boolean; // hero is in position
+  villainFolded: boolean;
+  heroFolded: boolean;
+  handComplete: boolean;
+  heroWon: boolean | null; // null = still playing
+  bbWon: number;
+  showdownReached: boolean;
+  waitingForHero: boolean;
+  villainActedThisStreet: boolean;
+  heroActedThisStreet: boolean;
+  facingBet: boolean;
+  facingBetAmount: number;
+  heroBetThisStreet: number;
+  villainBetThisStreet: number;
+  startingStack: number;
 }
 
 function pickRandom<T>(arr: readonly T[]): T {
@@ -127,33 +461,25 @@ function getEnabledPositions(settings: TrainerSettings): Position[] {
 
 function generateExplanation(handKey: string, position: string, gtoAction: string, freq: number, spotType: SpotType): string {
   const actionWord = gtoAction === "Raise" ? (spotType === "3-Bet" ? "3-bet" : "open-raise") : "fold";
-  if (freq >= 95) {
-    return `${handKey} is a mandatory ${actionWord} from ${position} (${gtoAction.toLowerCase()} 100%)`;
-  } else if (freq >= 70) {
-    return `${handKey} is a strong ${actionWord} from ${position} (${freq}% frequency)`;
-  } else if (freq >= 40) {
-    return `${handKey} is a mixed spot from ${position} — ${actionWord} ${freq}% of the time`;
-  } else if (freq > 0) {
-    return `${handKey} is mostly a fold from ${position} but can be ${spotType === "3-Bet" ? "3-bet" : "raised"} at low frequency (${freq}%)`;
-  } else {
-    return `${handKey} should always be folded from ${position}`;
-  }
+  if (freq >= 95) return `${handKey} is a mandatory ${actionWord} from ${position} (${gtoAction.toLowerCase()} 100%)`;
+  if (freq >= 70) return `${handKey} is a strong ${actionWord} from ${position} (${freq}% frequency)`;
+  if (freq >= 40) return `${handKey} is a mixed spot from ${position} -- ${actionWord} ${freq}% of the time`;
+  if (freq > 0) return `${handKey} is mostly a fold from ${position} but can be ${spotType === "3-Bet" ? "3-bet" : "raised"} at low frequency (${freq}%)`;
+  return `${handKey} should always be folded from ${position}`;
 }
 
-function generateScenario(settings: TrainerSettings): Scenario {
+// ── Generate Full Hand ──────────────────────────────────────────
+function generateHand(settings: TrainerSettings): HandState {
   const deck = shuffleDeck(buildDeck());
   let idx = 0;
   const deal = (): Card => deck[idx++];
 
   const enabledPositions = getEnabledPositions(settings);
-  if (enabledPositions.length === 0) {
-    // fallback
-    enabledPositions.push("BTN");
-  }
+  if (enabledPositions.length === 0) enabledPositions.push("BTN");
 
   const stack = settings.stackDepth;
 
-  // Decide spot type based on enabled settings
+  // Decide spot type
   const enabledSpots: SpotType[] = [];
   if (settings.spotTypes.RFI) enabledSpots.push("RFI");
   if (settings.spotTypes["3-Bet"]) enabledSpots.push("3-Bet");
@@ -162,88 +488,82 @@ function generateScenario(settings: TrainerSettings): Scenario {
   const spotType = pickRandom(enabledSpots);
 
   let heroPos: Position;
+  let villainPos: Position;
   let rangeData: RangeData | undefined;
-  let actionHistory: ActionEntry[] = [];
+  const actionHistory: ActionEntry[] = [];
   const stacks: Record<string, number> = {};
   POSITIONS.forEach((p) => (stacks[p] = stack));
   stacks["SB"] -= 0.5;
   stacks["BB"] -= 1;
   let pot = 1.5;
-  let facingAction = "";
   let raiserPosition: string | undefined;
 
   if (spotType === "3-Bet") {
-    // Pick a 3-bet scenario from available ranges
-    const available3Bets = THREEBET_RANGES.filter((r) =>
-      enabledPositions.includes(r.position as Position)
-    );
+    const available3Bets = THREEBET_RANGES.filter((r) => enabledPositions.includes(r.position as Position));
     if (available3Bets.length > 0) {
       rangeData = pickRandom(available3Bets);
       heroPos = rangeData.position as Position;
-
-      // Determine raiser from scenario text
       if (rangeData.scenario.includes("vs CO")) raiserPosition = "CO";
       else if (rangeData.scenario.includes("vs HJ")) raiserPosition = "HJ";
       else if (rangeData.scenario.includes("vs BTN")) raiserPosition = "BTN";
       else if (rangeData.scenario.includes("vs SB")) raiserPosition = "SB";
 
-      // Build action history: everyone folds to raiser, raiser opens, then to hero
+      villainPos = (raiserPosition || "CO") as Position;
+
       const raiserIdx = raiserPosition ? POSITIONS.indexOf(raiserPosition as Position) : 0;
       const heroIdx = POSITIONS.indexOf(heroPos);
 
       for (let i = 0; i < raiserIdx; i++) {
         const pos = POSITIONS[i];
-        actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold" });
+        actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold", street: "preflop" });
       }
 
-      // Raiser opens to 2.5bb
       if (raiserPosition) {
         stacks[raiserPosition] -= 2.5;
         pot += 2.5;
-        actionHistory.push({ position: raiserPosition, stack: stacks[raiserPosition], action: "Raise 2.5" });
+        actionHistory.push({ position: raiserPosition, stack: stacks[raiserPosition], action: "Raise 2.5", street: "preflop" });
       }
 
-      // Players between raiser and hero fold
       for (let i = raiserIdx + 1; i < heroIdx; i++) {
         const pos = POSITIONS[i];
         if (pos !== heroPos) {
-          actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold" });
+          actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold", street: "preflop" });
         }
       }
-
-      facingAction = `${raiserPosition} opens, ${heroPos} to act`;
     } else {
-      // Fallback to RFI
       heroPos = pickRandom(enabledPositions);
       rangeData = PREFLOP_RANGES.find((r) => r.position === heroPos);
+      villainPos = "BB";
       const heroIdx = POSITIONS.indexOf(heroPos);
       for (let i = 0; i < heroIdx; i++) {
         const pos = POSITIONS[i];
-        actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold" });
+        actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold", street: "preflop" });
       }
-      facingAction = `Folded to ${heroPos}`;
     }
   } else {
-    // RFI spot
-    // Filter positions that have RFI data (BB excluded)
     const rfiPositions = enabledPositions.filter((p) => PREFLOP_RANGES.some((r) => r.position === p));
     heroPos = rfiPositions.length > 0 ? pickRandom(rfiPositions) : pickRandom(enabledPositions);
     rangeData = PREFLOP_RANGES.find((r) => r.position === heroPos);
 
+    // Pick a villain from remaining active positions (usually BB or a caller)
     const heroIdx = POSITIONS.indexOf(heroPos);
     for (let i = 0; i < heroIdx; i++) {
       const pos = POSITIONS[i];
-      actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold" });
+      actionHistory.push({ position: pos, stack: stacks[pos], action: "Fold", street: "preflop" });
     }
-    facingAction = `Folded to ${heroPos}`;
+
+    // Villain will be BB by default (or last active)
+    villainPos = "BB";
   }
 
-  // Deal hero cards
+  // Deal cards
   const heroCards: [Card, Card] = [deal(), deal()];
-  const handKey = cardsToHandKey(heroCards[0], heroCards[1]);
-  const boardCards = [deal(), deal(), deal()];
+  const villainCards: [Card, Card] = [deal(), deal()];
+  const boardCards: Card[] = [deal(), deal(), deal(), deal(), deal()]; // all 5
 
-  // Determine GTO action from range
+  const handKey = cardsToHandKey(heroCards[0], heroCards[1]);
+
+  // Determine GTO action
   let grid: Record<string, number> = {};
   let gtoFrequency = 0;
   let gtoAction: "Fold" | "Call" | "Raise" | "Allin" = "Fold";
@@ -255,26 +575,31 @@ function generateScenario(settings: TrainerSettings): Scenario {
     gtoAction = gtoFrequency >= 50 ? "Raise" : "Fold";
     rangeScenario = `${rangeData.scenario}${stack !== 100 ? ` (${stack}bb)` : ""}`;
   } else {
-    // No range data - use a generic tight range
-    gtoFrequency = 0;
-    gtoAction = "Fold";
     rangeScenario = `6-Max, ${stack}bb, ${heroPos}`;
-    grid = {};
   }
 
   const callFrequency = spotType === "3-Bet" ? Math.max(0, Math.min(100, 100 - gtoFrequency - (100 - gtoFrequency) * 0.6)) : 0;
   const foldFrequency = 100 - gtoFrequency - callFrequency;
-
   const explanation = generateExplanation(handKey, heroPos, gtoAction, gtoFrequency, spotType);
 
-  // Build player seats
+  // Determine IP/OOP
   const heroIdx = POSITIONS.indexOf(heroPos);
+  const villainIdx = POSITIONS.indexOf(villainPos);
+  // In poker, BTN acts last postflop. Higher index = later position = IP postflop
+  // SB(4) and BB(5) are special: SB acts before BB, BB acts after SB
+  // Postflop order: SB first, then BB, then UTG...BTN
+  const postflopOrder = (pos: Position): number => {
+    const i = POSITIONS.indexOf(pos);
+    if (i === 4) return 0; // SB first
+    if (i === 5) return 1; // BB second
+    return i + 2; // UTG=2, HJ=3, CO=4, BTN=5
+  };
+  const heroIsIP = postflopOrder(heroPos) > postflopOrder(villainPos);
+
+  // Build player seats
   const players: PlayerSeat[] = POSITIONS.map((pos) => {
-    const posIdx = POSITIONS.indexOf(pos);
     let folded = false;
     let lastAction: string | undefined = undefined;
-
-    // Check action history
     const entry = actionHistory.find((a) => a.position === pos);
     if (entry) {
       folded = entry.action === "Fold";
@@ -289,29 +614,181 @@ function generateScenario(settings: TrainerSettings): Scenario {
       isCurrent: pos === heroPos,
       lastAction,
       hasFolded: folded,
+      currentBet: 0,
     };
   });
 
+  idx = idx; // capture deck index
+
   return {
+    deck,
+    deckIndex: idx,
     heroPosition: heroPos,
     heroCards,
+    villainPosition: villainPos,
+    villainCards,
     boardCards,
+    visibleBoard: [],
     players,
-    actionHistory,
+    stacks: { ...stacks },
     potSize: pot,
-    gtoAction,
-    gtoFrequency,
-    handKey,
-    rangeScenario,
     street: "preflop",
-    facingAction,
+    actionHistory,
+    streetActions: { preflop: [...actionHistory], flop: [], turn: [], river: [] },
+    handKey,
     spotType,
+    rangeScenario,
     rangeGrid: grid,
     raiserPosition,
+    gtoAction,
+    gtoFrequency,
     callFrequency,
     foldFrequency,
     explanation,
+    heroIsIP,
+    villainFolded: false,
+    heroFolded: false,
+    handComplete: false,
+    heroWon: null,
+    bbWon: 0,
+    showdownReached: false,
+    waitingForHero: true,
+    villainActedThisStreet: false,
+    heroActedThisStreet: false,
+    facingBet: spotType === "3-Bet",
+    facingBetAmount: spotType === "3-Bet" ? 2.5 : 0,
+    heroBetThisStreet: 0,
+    villainBetThisStreet: spotType === "3-Bet" ? 2.5 : 0,
+    startingStack: stack,
   };
+}
+
+// ── Opponent AI ──────────────────────────────────────────────────
+function opponentDecision(
+  street: Street,
+  facingBet: boolean,
+  betAmount: number,
+  potSize: number,
+): "fold" | "check" | "call" | "bet" | "raise" {
+  const r = Math.random() * 100;
+
+  if (street === "preflop") {
+    if (facingBet) {
+      // Facing hero raise preflop
+      if (r < 55) return "fold";
+      if (r < 90) return "call";
+      return "raise";
+    }
+    return "check"; // BB checks
+  }
+
+  if (facingBet) {
+    // Facing hero bet postflop
+    if (r < 40) return "fold";
+    if (r < 85) return "call";
+    return "raise";
+  }
+
+  // Acting first (no bet to face)
+  if (street === "flop") {
+    if (r < 60) return "check";
+    return "bet";
+  }
+  if (street === "turn") {
+    if (r < 70) return "check";
+    return "bet";
+  }
+  // River
+  if (r < 80) return "check";
+  return "bet";
+}
+
+function getOpponentBetSize(potSize: number, street: Street): number {
+  // Randomize between common sizings
+  const r = Math.random();
+  if (street === "flop") {
+    if (r < 0.5) return Math.round(potSize * 0.33 * 10) / 10;
+    if (r < 0.8) return Math.round(potSize * 0.5 * 10) / 10;
+    return Math.round(potSize * 0.75 * 10) / 10;
+  }
+  if (street === "turn") {
+    if (r < 0.4) return Math.round(potSize * 0.5 * 10) / 10;
+    if (r < 0.7) return Math.round(potSize * 0.66 * 10) / 10;
+    return Math.round(potSize * 0.75 * 10) / 10;
+  }
+  // River
+  if (r < 0.4) return Math.round(potSize * 0.5 * 10) / 10;
+  if (r < 0.7) return Math.round(potSize * 0.75 * 10) / 10;
+  return Math.round(potSize * 1.0 * 10) / 10;
+}
+
+// ── GTO Postflop Guidance ────────────────────────────────────────
+function getPostflopGuidance(
+  street: Street,
+  handEval: HandEvaluation,
+  boardTexture: BoardTexture,
+  draws: string[],
+  heroIsIP: boolean,
+  facingBet: boolean,
+): string {
+  if (street === "flop") {
+    if (facingBet) {
+      if (handEval.strength >= 4) return `Strong hand (${handEval.description}). Raise for value or call to trap.`;
+      if (handEval.strength >= 2.5) return `Decent hand (${handEval.description}). Calling is standard.`;
+      if (draws.length > 0) return `Drawing hand (${draws.join(", ")}). Call if getting odds, fold otherwise.`;
+      return `Weak hand (${handEval.description}). Consider folding vs this bet size.`;
+    }
+    // Not facing bet
+    if (handEval.strength >= 4) return `Strong hand (${handEval.description}). ${heroIsIP ? "Bet for value" : "Check-raise or lead for value"}.`;
+    if (handEval.strength >= 2) return `${boardTexture.cbetFrequency}. ${boardTexture.advice}`;
+    if (draws.length > 0) return `Drawing hand (${draws.join(", ")}). Good semi-bluff candidate.`;
+    return `Weak hand. ${boardTexture.type === "Dry" ? "Can c-bet as a bluff on this dry board." : "Better to check and give up."}`;
+  }
+
+  if (street === "turn") {
+    if (facingBet) {
+      if (handEval.strength >= 4) return `Strong hand. Continue for value -- raise or call.`;
+      if (handEval.strength >= 2.5) return `Decent hand (${handEval.description}). Calling is reasonable.`;
+      if (draws.length > 0) return `Drawing hand. Calculate pot odds before calling.`;
+      return `Weak hand. Likely a fold unless very small bet.`;
+    }
+    if (handEval.strength >= 4) return `Strong hand. Keep barreling for value.`;
+    if (handEval.strength >= 2.5) return `Decent hand. Bet ~55% of the time for thin value/protection.`;
+    return `Weak hand. Check and evaluate river.`;
+  }
+
+  // River
+  if (facingBet) {
+    if (handEval.strength >= 4) return `Strong hand. Raise for max value.`;
+    if (handEval.strength >= 2.5) return `Decent hand. Call -- this is a bluff-catching spot.`;
+    return `Weak hand. Fold unless you have a specific read.`;
+  }
+  if (handEval.strength >= 4) return `Strong hand (${handEval.description}). Value bet -- go for 66-100% pot.`;
+  if (handEval.strength >= 2.5) return `Thin value spot (${handEval.description}). Consider 33-50% pot bet.`;
+  if (handEval.strength <= 0.5 && draws.length === 0) return `Missed draw / air. Bluff candidate at 50-75% pot.`;
+  return `Marginal hand. Check and showdown.`;
+}
+
+// ── Showdown winner (simplified) ─────────────────────────────────
+function determineWinner(
+  heroCards: [Card, Card],
+  villainCards: [Card, Card],
+  board: Card[],
+): "hero" | "villain" | "split" {
+  const heroEval = evaluateHand(heroCards, board);
+  const villainEval = evaluateHand(villainCards, board);
+
+  if (heroEval.strength > villainEval.strength) return "hero";
+  if (villainEval.strength > heroEval.strength) return "villain";
+
+  // Tie-break by high card
+  const heroVals = heroCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+  const villainVals = villainCards.map((c) => RANK_VALUES[c.rank]).sort((a, b) => b - a);
+  if (heroVals[0] > villainVals[0]) return "hero";
+  if (villainVals[0] > heroVals[0]) return "villain";
+  if (heroVals[1] > villainVals[1]) return "hero";
+  if (villainVals[1] > heroVals[1]) return "villain";
+  return "split";
 }
 
 // ── Suit symbol helpers ─────────────────────────────────────────────
@@ -322,6 +799,21 @@ function CardInline({ card }: { card: Card }) {
   return (
     <span className={`${SUIT_CLR[card.suit]} font-bold`}>
       {card.rank}{SUIT_SYM[card.suit]}
+    </span>
+  );
+}
+
+function BoardInline({ cards }: { cards: Card[] }) {
+  return (
+    <span>
+      [
+      {cards.map((c, i) => (
+        <span key={i}>
+          {i > 0 && " "}
+          <CardInline card={c} />
+        </span>
+      ))}
+      ]
     </span>
   );
 }
@@ -426,7 +918,7 @@ function SettingsPanel({
             </div>
           </div>
 
-          <div className="flex gap-6">
+          <div className="flex gap-6 flex-wrap">
             {/* Blind Structure */}
             <div>
               <label className="text-xs text-gray-500 uppercase tracking-wider font-semibold mb-2 block">
@@ -444,6 +936,28 @@ function SettingsPanel({
               </label>
               <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-300">
                 6-Max Cash
+              </div>
+            </div>
+
+            {/* Speed */}
+            <div>
+              <label className="text-xs text-gray-500 uppercase tracking-wider font-semibold mb-2 block">
+                Speed
+              </label>
+              <div className="flex gap-2">
+                {(["normal", "fast"] as SpeedMode[]).map((spd) => (
+                  <button
+                    key={spd}
+                    onClick={() => onChange({ ...settings, speed: spd })}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all capitalize ${
+                      settings.speed === spd
+                        ? "bg-orange-600/80 text-white border border-orange-500/40"
+                        : "bg-gray-800 text-gray-500 border border-gray-700 hover:text-gray-300"
+                    }`}
+                  >
+                    {spd}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
@@ -465,6 +979,28 @@ function SettingsPanel({
                   }`}
                 >
                   {spot === "RFI" ? "Open Raise (RFI)" : "3-Bet Pots"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Starting Street */}
+          <div>
+            <label className="text-xs text-gray-500 uppercase tracking-wider font-semibold mb-2 block">
+              Starting Street
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              {(["preflop", "flop", "turn", "river"] as StartingStreet[]).map((st) => (
+                <button
+                  key={st}
+                  onClick={() => onChange({ ...settings, startingStreet: st })}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all capitalize ${
+                    settings.startingStreet === st
+                      ? "bg-cyan-600/80 text-white border border-cyan-500/40"
+                      : "bg-gray-800 text-gray-500 border border-gray-700 hover:text-gray-300"
+                  }`}
+                >
+                  {st}
                 </button>
               ))}
             </div>
@@ -519,114 +1055,286 @@ function MiniRangeGrid({
   );
 }
 
-// ── GTO Recommendation Panel ────────────────────────────────────────
-function GTOPanel({
-  scenario,
-  correct,
-  userAction,
-  onNext,
-}: {
-  scenario: Scenario;
-  correct: boolean;
-  userAction: string;
-  onNext: () => void;
+// ── Action History Bar ──────────────────────────────────────────────
+function ActionHistoryBar({ hand }: { hand: HandState }) {
+  const segments: { type: "action" | "divider"; text: string; street: Street }[] = [];
+
+  // Preflop actions
+  for (const a of hand.streetActions.preflop) {
+    segments.push({ type: "action", text: `${a.position} ${a.action}`, street: "preflop" });
+  }
+
+  // Flop divider + actions
+  if (hand.visibleBoard.length >= 3) {
+    segments.push({
+      type: "divider",
+      text: `FLOP`,
+      street: "flop",
+    });
+    for (const a of hand.streetActions.flop) {
+      segments.push({ type: "action", text: `${a.position} ${a.action}`, street: "flop" });
+    }
+  }
+
+  // Turn divider + actions
+  if (hand.visibleBoard.length >= 4) {
+    segments.push({
+      type: "divider",
+      text: `TURN`,
+      street: "turn",
+    });
+    for (const a of hand.streetActions.turn) {
+      segments.push({ type: "action", text: `${a.position} ${a.action}`, street: "turn" });
+    }
+  }
+
+  // River divider + actions
+  if (hand.visibleBoard.length >= 5) {
+    segments.push({
+      type: "divider",
+      text: `RIVER`,
+      street: "river",
+    });
+    for (const a of hand.streetActions.river) {
+      segments.push({ type: "action", text: `${a.position} ${a.action}`, street: "river" });
+    }
+  }
+
+  if (segments.length === 0) return null;
+
+  return (
+    <div className="bg-gray-900/80 border-b border-gray-800 px-4 py-2 flex items-center gap-1 overflow-x-auto text-xs font-mono whitespace-nowrap scrollbar-thin">
+      <span className="text-gray-600 mr-2 text-[10px] font-sans font-semibold uppercase">
+        {hand.spotType === "3-Bet" ? "3-BET" : "RFI"}
+      </span>
+      {segments.map((seg, i) => (
+        <span key={i} className="flex items-center gap-1">
+          {i > 0 && seg.type === "action" && <span className="text-gray-700 mx-0.5">|</span>}
+          {seg.type === "divider" ? (
+            <span className={`mx-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${
+              seg.street === "flop" ? "bg-emerald-900/50 text-emerald-400" :
+              seg.street === "turn" ? "bg-blue-900/50 text-blue-400" :
+              "bg-purple-900/50 text-purple-400"
+            }`}>
+              {seg.text}
+            </span>
+          ) : (
+            <span className={`${
+              seg.street === hand.street ? "text-yellow-400" : "text-gray-500"
+            }`}>
+              {seg.text}
+            </span>
+          )}
+        </span>
+      ))}
+      {hand.waitingForHero && !hand.handComplete && (
+        <>
+          <span className="text-gray-700 mx-0.5">|</span>
+          <span className="text-yellow-400 font-bold animate-pulse">{hand.heroPosition} to act</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Board Texture Display ───────────────────────────────────────────
+function BoardTexturePanel({ boardTexture, draws, handEval }: {
+  boardTexture: BoardTexture;
+  draws: string[];
+  handEval: HandEvaluation;
 }) {
   return (
-    <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center animate-fade-in overflow-y-auto py-4">
+    <div className="bg-gray-800/60 rounded-lg p-3 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* Board texture badge */}
+        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+          boardTexture.type === "Dry" ? "bg-gray-700 text-gray-300" :
+          boardTexture.type === "Semi-wet" ? "bg-yellow-900/60 text-yellow-300" :
+          "bg-red-900/60 text-red-300"
+        }`}>
+          {boardTexture.type}
+        </span>
+        {boardTexture.flushDraw && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/60 text-blue-300">Flush Draw Possible</span>
+        )}
+        {boardTexture.flushComplete && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-700/60 text-blue-200">Flush Complete</span>
+        )}
+        {boardTexture.straightDraw && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-orange-900/60 text-orange-300">Straight Draw Possible</span>
+        )}
+        {boardTexture.paired && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-700 text-gray-300">Paired</span>
+        )}
+      </div>
+
+      {/* Hand strength */}
+      <div className="flex items-center gap-2">
+        <span className="text-gray-500 text-xs">Hand:</span>
+        <span className={`text-xs font-bold ${
+          handEval.strength >= 4 ? "text-emerald-400" :
+          handEval.strength >= 2 ? "text-yellow-400" :
+          handEval.strength >= 1 ? "text-orange-400" :
+          "text-red-400"
+        }`}>
+          {handEval.rank} - {handEval.description}
+        </span>
+      </div>
+
+      {/* Draws */}
+      {draws.length > 0 && (
+        <div className="flex items-center gap-2">
+          <span className="text-gray-500 text-xs">Draws:</span>
+          <span className="text-cyan-400 text-xs font-semibold">{draws.join(", ")}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Result Screen ───────────────────────────────────────────────────
+function ResultScreen({
+  hand,
+  onNext,
+}: {
+  hand: HandState;
+  onNext: () => void;
+}) {
+  const heroEval = evaluateHand(hand.heroCards, hand.visibleBoard);
+  const villainEval = evaluateHand(hand.villainCards, hand.visibleBoard);
+  const won = hand.heroWon === true;
+  const split = hand.heroWon === null && hand.showdownReached;
+
+  return (
+    <div className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center animate-fade-in overflow-y-auto py-4">
       <div className="bg-gray-900 border border-gray-700 rounded-2xl p-5 max-w-lg w-full mx-4 shadow-2xl">
         {/* Result header */}
         <div className="text-center mb-4">
-          <div className={`text-4xl mb-2 ${correct ? "text-emerald-400" : "text-red-400"}`}>
-            {correct ? "\u2713" : "\u2717"}
+          <div className={`text-4xl mb-2 ${won ? "text-emerald-400" : hand.heroFolded ? "text-gray-400" : "text-red-400"}`}>
+            {won ? "\u2713" : hand.heroFolded ? "-" : "\u2717"}
           </div>
-          <h3 className={`text-lg font-black mb-1 ${correct ? "text-emerald-400" : "text-red-400"}`}>
-            {correct ? "Correct!" : "Incorrect"}
+          <h3 className={`text-lg font-black mb-1 ${
+            won ? "text-emerald-400" :
+            hand.heroFolded ? "text-gray-300" :
+            hand.villainFolded ? "text-emerald-400" :
+            "text-red-400"
+          }`}>
+            {hand.heroFolded ? "You folded" :
+             hand.villainFolded ? "Opponent folded - You win!" :
+             won ? "You win at showdown!" :
+             split ? "Split pot" :
+             "You lose at showdown"}
           </h3>
-          <p className="text-gray-400 text-xs">
-            You chose <span className={`font-bold ${correct ? "text-emerald-300" : "text-red-300"}`}>{userAction}</span>
-            {" | "}GTO: <span className="text-white font-bold">{scenario.gtoAction}</span> with{" "}
-            <span className="text-white font-bold">{scenario.handKey}</span> from{" "}
-            <span className="text-emerald-400 font-bold">{scenario.heroPosition}</span>
-          </p>
         </div>
 
-        {/* Explanation */}
-        <div className={`rounded-lg p-3 mb-4 text-sm border ${
-          correct
-            ? "bg-emerald-950/40 border-emerald-800/40 text-emerald-200"
-            : "bg-red-950/40 border-red-800/40 text-red-200"
-        }`}>
-          {scenario.explanation}
-        </div>
-
-        {/* Frequency bars */}
-        <div className="bg-gray-800/60 rounded-lg p-3 mb-4 space-y-2">
-          <div className="text-xs text-gray-500 mb-1 font-semibold">{scenario.rangeScenario}</div>
-          {/* Raise */}
-          <div className="flex items-center gap-2">
-            <span className="text-gray-400 text-xs w-12 text-right">Raise</span>
-            <div className="flex-1 h-2.5 bg-gray-700 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-red-500 rounded-full transition-all"
-                style={{ width: `${scenario.gtoFrequency}%` }}
-              />
-            </div>
-            <span className="text-white text-xs font-bold w-10">{scenario.gtoFrequency}%</span>
+        {/* Board */}
+        {hand.visibleBoard.length > 0 && (
+          <div className="text-center mb-3">
+            <span className="text-gray-500 text-xs">Board: </span>
+            <BoardInline cards={hand.visibleBoard} />
           </div>
-          {/* Call (only in 3-bet spots) */}
-          {scenario.spotType === "3-Bet" && (
-            <div className="flex items-center gap-2">
-              <span className="text-gray-400 text-xs w-12 text-right">Call</span>
-              <div className="flex-1 h-2.5 bg-gray-700 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-emerald-500 rounded-full transition-all"
-                  style={{ width: `${scenario.callFrequency}%` }}
-                />
+        )}
+
+        {/* Hands comparison */}
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          {/* Hero */}
+          <div className={`rounded-lg p-3 border ${won ? "bg-emerald-950/30 border-emerald-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
+            <div className="text-xs text-gray-500 mb-1">Hero ({hand.heroPosition})</div>
+            <div className="flex gap-1 mb-1">
+              <CardInline card={hand.heroCards[0]} /> <CardInline card={hand.heroCards[1]} />
+            </div>
+            {hand.visibleBoard.length > 0 && (
+              <div className="text-[10px] text-gray-400">{heroEval.rank} - {heroEval.description}</div>
+            )}
+          </div>
+
+          {/* Villain */}
+          {hand.showdownReached && (
+            <div className={`rounded-lg p-3 border ${!won && !hand.heroFolded ? "bg-red-950/30 border-red-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
+              <div className="text-xs text-gray-500 mb-1">Villain ({hand.villainPosition})</div>
+              <div className="flex gap-1 mb-1">
+                <CardInline card={hand.villainCards[0]} /> <CardInline card={hand.villainCards[1]} />
               </div>
-              <span className="text-white text-xs font-bold w-10">{Math.round(scenario.callFrequency)}%</span>
+              {hand.visibleBoard.length > 0 && (
+                <div className="text-[10px] text-gray-400">{villainEval.rank} - {villainEval.description}</div>
+              )}
             </div>
           )}
-          {/* Fold */}
+          {!hand.showdownReached && (
+            <div className="rounded-lg p-3 border bg-gray-800/60 border-gray-700/40">
+              <div className="text-xs text-gray-500 mb-1">Villain ({hand.villainPosition})</div>
+              <div className="text-gray-600 text-xs">{hand.villainFolded ? "Folded" : "Mucked"}</div>
+            </div>
+          )}
+        </div>
+
+        {/* EV result */}
+        <div className={`rounded-lg p-3 mb-4 text-center border ${
+          hand.bbWon > 0 ? "bg-emerald-950/30 border-emerald-800/40" :
+          hand.bbWon < 0 ? "bg-red-950/30 border-red-800/40" :
+          "bg-gray-800/60 border-gray-700/40"
+        }`}>
+          <span className={`text-lg font-black ${
+            hand.bbWon > 0 ? "text-emerald-400" :
+            hand.bbWon < 0 ? "text-red-400" :
+            "text-gray-300"
+          }`}>
+            {hand.bbWon > 0 ? "+" : ""}{hand.bbWon.toFixed(1)}bb
+          </span>
+          <div className="text-xs text-gray-500 mt-0.5">
+            {hand.bbWon > 0 ? "Won this hand" : hand.bbWon < 0 ? "Lost this hand" : "Break even"}
+          </div>
+        </div>
+
+        {/* Preflop GTO info */}
+        <div className="bg-gray-800/60 rounded-lg p-3 mb-4 space-y-2">
+          <div className="text-xs text-gray-500 font-semibold">{hand.rangeScenario}</div>
+          <div className="text-xs text-gray-300">{hand.explanation}</div>
+          <div className="flex items-center gap-2">
+            <span className="text-gray-400 text-xs w-12 text-right">Raise</span>
+            <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+              <div className="h-full bg-red-500 rounded-full" style={{ width: `${hand.gtoFrequency}%` }} />
+            </div>
+            <span className="text-white text-xs font-bold w-10">{hand.gtoFrequency}%</span>
+          </div>
           <div className="flex items-center gap-2">
             <span className="text-gray-400 text-xs w-12 text-right">Fold</span>
-            <div className="flex-1 h-2.5 bg-gray-700 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-gray-500 rounded-full transition-all"
-                style={{ width: `${scenario.foldFrequency}%` }}
-              />
+            <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+              <div className="h-full bg-gray-500 rounded-full" style={{ width: `${hand.foldFrequency}%` }} />
             </div>
-            <span className="text-white text-xs font-bold w-10">{Math.round(scenario.foldFrequency)}%</span>
+            <span className="text-white text-xs font-bold w-10">{Math.round(hand.foldFrequency)}%</span>
           </div>
         </div>
 
         {/* Mini range grid */}
-        <div className="mb-4">
-          <div className="text-xs text-gray-500 font-semibold mb-2">
-            Full Range ({scenario.heroPosition} {scenario.spotType === "3-Bet" ? "3-Bet" : "RFI"})
+        {Object.keys(hand.rangeGrid).length > 0 && (
+          <div className="mb-4">
+            <div className="text-xs text-gray-500 font-semibold mb-2">
+              Full Range ({hand.heroPosition} {hand.spotType === "3-Bet" ? "3-Bet" : "RFI"})
+            </div>
+            <div className="flex justify-center">
+              <MiniRangeGrid
+                grid={hand.rangeGrid}
+                highlightHand={hand.handKey}
+                correct={hand.heroWon === true || hand.villainFolded}
+              />
+            </div>
+            <div className="flex gap-2 items-center justify-center mt-2 text-[9px] text-gray-500">
+              {[0, 20, 50, 80, 100].map((f) => (
+                <div key={f} className="flex items-center gap-0.5">
+                  <div className={`w-2.5 h-2.5 rounded-sm ${getFrequencyColor(f)}`} />
+                  <span>{f}%</span>
+                </div>
+              ))}
+            </div>
           </div>
-          <div className="flex justify-center">
-            <MiniRangeGrid
-              grid={scenario.rangeGrid}
-              highlightHand={scenario.handKey}
-              correct={correct}
-            />
-          </div>
-          {/* Legend */}
-          <div className="flex gap-2 items-center justify-center mt-2 text-[9px] text-gray-500">
-            {[0, 20, 50, 80, 100].map((f) => (
-              <div key={f} className="flex items-center gap-0.5">
-                <div className={`w-2.5 h-2.5 rounded-sm ${getFrequencyColor(f)}`} />
-                <span>{f}%</span>
-              </div>
-            ))}
-          </div>
-        </div>
+        )}
 
         <button
           onClick={onNext}
           className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all active:scale-95"
         >
-          Next Hand
+          Deal Next Hand
         </button>
       </div>
     </div>
@@ -647,7 +1355,6 @@ function SessionStatsPanel({
 }) {
   const accuracy = stats.total > 0 ? Math.round((stats.correct / stats.total) * 100) : 0;
 
-  // Top 5 most common mistakes
   const mistakeCounts = new Map<string, number>();
   for (const m of stats.mistakes) {
     const key = `${m.handKey} (${m.position})`;
@@ -672,41 +1379,45 @@ function SessionStatsPanel({
         <div className="flex items-center gap-3 font-normal normal-case">
           <span className="text-gray-500">{stats.total} hands</span>
           {stats.total > 0 && (
-            <span className={`font-bold ${accuracy >= 70 ? "text-emerald-400" : accuracy >= 50 ? "text-yellow-400" : "text-red-400"}`}>
-              {accuracy}%
-            </span>
-          )}
-          {stats.streak > 0 && (
-            <span className="text-orange-400 font-bold">{stats.streak} streak</span>
+            <>
+              <span className={`font-bold ${stats.totalBBWon >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                {stats.totalBBWon >= 0 ? "+" : ""}{stats.totalBBWon.toFixed(1)}bb
+              </span>
+              <span className={`font-bold ${accuracy >= 70 ? "text-emerald-400" : accuracy >= 50 ? "text-yellow-400" : "text-red-400"}`}>
+                {accuracy}%
+              </span>
+            </>
           )}
         </div>
       </button>
 
       {isOpen && (
         <div className="px-4 pb-4 space-y-4 animate-fade-in">
-          {/* Overview row */}
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid grid-cols-5 gap-2">
             <div className="bg-gray-800/60 rounded-lg p-2 text-center">
               <div className="text-lg font-bold text-white">{stats.total}</div>
               <div className="text-[9px] text-gray-500 uppercase">Hands</div>
             </div>
             <div className="bg-gray-800/60 rounded-lg p-2 text-center">
-              <div className={`text-lg font-bold ${accuracy >= 70 ? "text-emerald-400" : accuracy >= 50 ? "text-yellow-400" : "text-red-400"}`}>
-                {stats.total > 0 ? `${accuracy}%` : "--"}
+              <div className="text-lg font-bold text-emerald-400">{stats.handsWon}</div>
+              <div className="text-[9px] text-gray-500 uppercase">Won</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-2 text-center">
+              <div className="text-lg font-bold text-red-400">{stats.handsLost}</div>
+              <div className="text-[9px] text-gray-500 uppercase">Lost</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-2 text-center">
+              <div className={`text-lg font-bold ${stats.totalBBWon >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                {stats.totalBBWon >= 0 ? "+" : ""}{stats.totalBBWon.toFixed(1)}
               </div>
-              <div className="text-[9px] text-gray-500 uppercase">Accuracy</div>
+              <div className="text-[9px] text-gray-500 uppercase">BB Won</div>
             </div>
             <div className="bg-gray-800/60 rounded-lg p-2 text-center">
-              <div className="text-lg font-bold text-orange-400">{stats.streak}</div>
-              <div className="text-[9px] text-gray-500 uppercase">Streak</div>
-            </div>
-            <div className="bg-gray-800/60 rounded-lg p-2 text-center">
-              <div className="text-lg font-bold text-purple-400">{stats.bestStreak}</div>
-              <div className="text-[9px] text-gray-500 uppercase">Best</div>
+              <div className="text-lg font-bold text-orange-400">{stats.bestStreak}</div>
+              <div className="text-[9px] text-gray-500 uppercase">Best Streak</div>
             </div>
           </div>
 
-          {/* Per-position accuracy */}
           <div>
             <div className="text-xs text-gray-500 font-semibold mb-2 uppercase tracking-wider">Accuracy by Position</div>
             <div className="grid grid-cols-6 gap-1.5">
@@ -730,7 +1441,6 @@ function SessionStatsPanel({
             </div>
           </div>
 
-          {/* Most common mistakes */}
           {topMistakes.length > 0 && (
             <div>
               <div className="text-xs text-gray-500 font-semibold mb-2 uppercase tracking-wider">Common Mistakes</div>
@@ -745,7 +1455,6 @@ function SessionStatsPanel({
             </div>
           )}
 
-          {/* Reset button */}
           <button
             onClick={onReset}
             className="w-full py-2 bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white text-xs font-semibold rounded-lg transition-all border border-gray-700"
@@ -763,121 +1472,623 @@ export default function TrainerPage() {
   const [settings, setSettings] = useState<TrainerSettings>(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
-  const [scenario, setScenario] = useState<Scenario>(() => generateScenario(DEFAULT_SETTINGS));
-  const [showResult, setShowResult] = useState(false);
-  const [lastCorrect, setLastCorrect] = useState(false);
-  const [lastUserAction, setLastUserAction] = useState("");
+  const [hand, setHand] = useState<HandState>(() => generateHand(DEFAULT_SETTINGS));
   const [sessionStats, setSessionStats] = useState<SessionStats>(emptySessionStats);
+  const [gtoAdvice, setGtoAdvice] = useState<string>("");
+  const opponentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Regenerate when settings change
+  // Compute board analysis
+  const boardTexture = useMemo(() => analyzeBoardTexture(hand.visibleBoard), [hand.visibleBoard]);
+  const handEval = useMemo(() => evaluateHand(hand.heroCards, hand.visibleBoard), [hand.heroCards, hand.visibleBoard]);
+  const draws = useMemo(() => analyzeDraws(hand.heroCards, hand.visibleBoard), [hand.heroCards, hand.visibleBoard]);
+
+  // Regenerate when settings change (only if not mid-hand)
   const handleSettingsChange = useCallback((newSettings: TrainerSettings) => {
     setSettings(newSettings);
-    if (!showResult) {
-      setScenario(generateScenario(newSettings));
-    }
-  }, [showResult]);
-
-  const handleAction = useCallback(
-    (action: "Fold" | "Call" | "Raise" | "Allin") => {
-      if (showResult) return;
-
-      let correct = false;
-      if (scenario.gtoAction === "Raise") {
-        correct = action === "Raise" || action === "Allin";
-      } else {
-        correct = action === "Fold";
+    if (hand.street === "preflop" && !hand.heroActedThisStreet && !hand.handComplete) {
+      const newHand = generateHand(newSettings);
+      // Handle starting street
+      if (newSettings.startingStreet !== "preflop") {
+        advanceToStreet(newHand, newSettings.startingStreet);
       }
+      setHand(newHand);
+      setGtoAdvice("");
+    }
+  }, [hand]);
 
-      setLastCorrect(correct);
-      setLastUserAction(action);
+  // Advance hand to a later street (for starting street setting)
+  function advanceToStreet(h: HandState, target: StartingStreet) {
+    // Simulate preflop action: hero raises, villain calls
+    if (target === "preflop") return;
+
+    // Hero raised preflop
+    const raiseAmt = h.spotType === "3-Bet" ? 7.5 : 2.5;
+    h.stacks[h.heroPosition] -= raiseAmt;
+    h.potSize += raiseAmt;
+    h.streetActions.preflop.push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: `Raise ${raiseAmt}`, street: "preflop" });
+
+    // Villain calls
+    const callAmt = raiseAmt - h.villainBetThisStreet;
+    h.stacks[h.villainPosition] -= callAmt;
+    h.potSize += callAmt;
+    h.streetActions.preflop.push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: "Call", street: "preflop" });
+
+    // Move to flop
+    h.street = "flop";
+    h.visibleBoard = h.boardCards.slice(0, 3);
+    h.heroBetThisStreet = 0;
+    h.villainBetThisStreet = 0;
+    h.facingBet = false;
+    h.facingBetAmount = 0;
+    h.heroActedThisStreet = false;
+    h.villainActedThisStreet = false;
+
+    if (target === "flop") {
+      // Set who acts first
+      if (!h.heroIsIP) {
+        h.waitingForHero = true;
+      } else {
+        h.waitingForHero = false;
+        // Villain acts first
+      }
+      return;
+    }
+
+    // Simulate flop: both check
+    h.streetActions.flop.push({ position: h.heroIsIP ? h.villainPosition : h.heroPosition, stack: 0, action: "Check", street: "flop" });
+    h.streetActions.flop.push({ position: h.heroIsIP ? h.heroPosition : h.villainPosition, stack: 0, action: "Check", street: "flop" });
+
+    // Move to turn
+    h.street = "turn";
+    h.visibleBoard = h.boardCards.slice(0, 4);
+    h.heroBetThisStreet = 0;
+    h.villainBetThisStreet = 0;
+    h.facingBet = false;
+    h.facingBetAmount = 0;
+    h.heroActedThisStreet = false;
+    h.villainActedThisStreet = false;
+
+    if (target === "turn") {
+      if (!h.heroIsIP) {
+        h.waitingForHero = true;
+      } else {
+        h.waitingForHero = false;
+      }
+      return;
+    }
+
+    // Simulate turn: both check
+    h.streetActions.turn.push({ position: h.heroIsIP ? h.villainPosition : h.heroPosition, stack: 0, action: "Check", street: "turn" });
+    h.streetActions.turn.push({ position: h.heroIsIP ? h.heroPosition : h.villainPosition, stack: 0, action: "Check", street: "turn" });
+
+    // Move to river
+    h.street = "river";
+    h.visibleBoard = h.boardCards.slice(0, 5);
+    h.heroBetThisStreet = 0;
+    h.villainBetThisStreet = 0;
+    h.facingBet = false;
+    h.facingBetAmount = 0;
+    h.heroActedThisStreet = false;
+    h.villainActedThisStreet = false;
+
+    if (!h.heroIsIP) {
+      h.waitingForHero = true;
+    } else {
+      h.waitingForHero = false;
+    }
+  }
+
+  // Process opponent action
+  const processOpponentAction = useCallback((currentHand: HandState) => {
+    const h = { ...currentHand };
+    h.stacks = { ...currentHand.stacks };
+    h.streetActions = {
+      preflop: [...currentHand.streetActions.preflop],
+      flop: [...currentHand.streetActions.flop],
+      turn: [...currentHand.streetActions.turn],
+      river: [...currentHand.streetActions.river],
+    };
+    h.actionHistory = [...currentHand.actionHistory];
+    h.players = currentHand.players.map((p) => ({ ...p }));
+
+    const decision = opponentDecision(
+      h.street,
+      h.heroBetThisStreet > 0,
+      h.heroBetThisStreet,
+      h.potSize,
+    );
+
+    const villainPlayer = h.players.find((p) => p.position === h.villainPosition);
+
+    if (decision === "fold") {
+      if (villainPlayer) {
+        villainPlayer.hasFolded = true;
+        villainPlayer.lastAction = "Fold";
+        villainPlayer.isActive = false;
+      }
+      h.streetActions[h.street].push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: "Fold", street: h.street });
+      h.villainFolded = true;
+      h.handComplete = true;
+      h.heroWon = true;
+      h.waitingForHero = false;
+      // Calculate BB won
+      const invested = h.startingStack - h.stacks[h.heroPosition];
+      h.bbWon = h.potSize - invested;
+      setHand(h);
+      return;
+    }
+
+    if (decision === "check") {
+      if (villainPlayer) villainPlayer.lastAction = "Check";
+      h.streetActions[h.street].push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: "Check", street: h.street });
+      h.villainActedThisStreet = true;
+
+      // If hero has also acted (checked), move to next street
+      if (h.heroActedThisStreet) {
+        moveToNextStreet(h);
+      } else {
+        // Hero's turn
+        h.waitingForHero = true;
+        h.facingBet = false;
+        h.facingBetAmount = 0;
+      }
+      setHand(h);
+      return;
+    }
+
+    if (decision === "call") {
+      const callAmt = h.heroBetThisStreet - h.villainBetThisStreet;
+      const actualCall = Math.min(callAmt, h.stacks[h.villainPosition]);
+      h.stacks[h.villainPosition] -= actualCall;
+      h.potSize += actualCall;
+      h.villainBetThisStreet += actualCall;
+      if (villainPlayer) {
+        villainPlayer.stack = h.stacks[h.villainPosition];
+        villainPlayer.lastAction = "Call";
+        villainPlayer.currentBet = h.villainBetThisStreet;
+      }
+      h.streetActions[h.street].push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: "Call", street: h.street });
+      h.villainActedThisStreet = true;
+
+      // Both have acted, move to next street
+      moveToNextStreet(h);
+      setHand(h);
+      return;
+    }
+
+    if (decision === "bet") {
+      const betSize = getOpponentBetSize(h.potSize, h.street);
+      const actualBet = Math.min(betSize, h.stacks[h.villainPosition]);
+      h.stacks[h.villainPosition] -= actualBet;
+      h.potSize += actualBet;
+      h.villainBetThisStreet = actualBet;
+      if (villainPlayer) {
+        villainPlayer.stack = h.stacks[h.villainPosition];
+        villainPlayer.lastAction = `Bet ${actualBet.toFixed(1)}`;
+        villainPlayer.currentBet = actualBet;
+      }
+      h.streetActions[h.street].push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: `Bet ${actualBet.toFixed(1)}`, street: h.street });
+      h.villainActedThisStreet = true;
+      h.facingBet = true;
+      h.facingBetAmount = actualBet;
+      h.waitingForHero = true;
+      setHand(h);
+      return;
+    }
+
+    if (decision === "raise") {
+      const raiseSize = h.heroBetThisStreet * 2.5;
+      const actualRaise = Math.min(raiseSize, h.stacks[h.villainPosition] + h.villainBetThisStreet);
+      const additional = actualRaise - h.villainBetThisStreet;
+      h.stacks[h.villainPosition] -= additional;
+      h.potSize += additional;
+      h.villainBetThisStreet = actualRaise;
+      if (villainPlayer) {
+        villainPlayer.stack = h.stacks[h.villainPosition];
+        villainPlayer.lastAction = `Raise ${actualRaise.toFixed(1)}`;
+        villainPlayer.currentBet = actualRaise;
+      }
+      h.streetActions[h.street].push({ position: h.villainPosition, stack: h.stacks[h.villainPosition], action: `Raise ${actualRaise.toFixed(1)}`, street: h.street });
+      h.villainActedThisStreet = true;
+      h.facingBet = true;
+      h.facingBetAmount = actualRaise;
+      h.waitingForHero = true;
+      setHand(h);
+      return;
+    }
+  }, []);
+
+  function moveToNextStreet(h: HandState) {
+    // Reset street bets and clear current bets on players
+    h.players.forEach((p) => { p.currentBet = 0; });
+    h.heroBetThisStreet = 0;
+    h.villainBetThisStreet = 0;
+    h.heroActedThisStreet = false;
+    h.villainActedThisStreet = false;
+    h.facingBet = false;
+    h.facingBetAmount = 0;
+
+    if (h.street === "preflop") {
+      h.street = "flop";
+      h.visibleBoard = h.boardCards.slice(0, 3);
+    } else if (h.street === "flop") {
+      h.street = "turn";
+      h.visibleBoard = h.boardCards.slice(0, 4);
+    } else if (h.street === "turn") {
+      h.street = "river";
+      h.visibleBoard = h.boardCards.slice(0, 5);
+    } else {
+      // River action complete -> showdown
+      h.showdownReached = true;
+      h.handComplete = true;
+      h.waitingForHero = false;
+      const winner = determineWinner(h.heroCards, h.villainCards, h.visibleBoard);
+      h.heroWon = winner === "hero";
+      const invested = h.startingStack - h.stacks[h.heroPosition];
+      if (winner === "hero") {
+        h.bbWon = h.potSize - invested;
+      } else if (winner === "villain") {
+        h.bbWon = -invested;
+      } else {
+        h.bbWon = h.potSize / 2 - invested;
+      }
+      return;
+    }
+
+    // Update last actions for new street display
+    h.players.forEach((p) => {
+      if (!p.hasFolded && p.position !== h.heroPosition && p.position !== h.villainPosition) {
+        // Keep folded status
+      } else if (!p.hasFolded) {
+        p.lastAction = undefined;
+      }
+    });
+
+    // Determine who acts first postflop
+    if (h.heroIsIP) {
+      // Villain acts first (OOP)
+      h.waitingForHero = false;
+    } else {
+      // Hero acts first (OOP)
+      h.waitingForHero = true;
+    }
+  }
+
+  // Trigger opponent action when it's their turn
+  useEffect(() => {
+    if (hand.handComplete || hand.waitingForHero || hand.heroFolded || hand.villainFolded) return;
+
+    const delay = settings.speed === "fast" ? 200 : 800;
+    opponentTimerRef.current = setTimeout(() => {
+      processOpponentAction(hand);
+    }, delay);
+
+    return () => {
+      if (opponentTimerRef.current) clearTimeout(opponentTimerRef.current);
+    };
+  }, [hand, settings.speed, processOpponentAction]);
+
+  // Update GTO advice whenever street/board changes
+  useEffect(() => {
+    if (hand.street === "preflop") {
+      setGtoAdvice(hand.explanation);
+    } else if (hand.visibleBoard.length > 0) {
+      const bt = analyzeBoardTexture(hand.visibleBoard);
+      const he = evaluateHand(hand.heroCards, hand.visibleBoard);
+      const dr = analyzeDraws(hand.heroCards, hand.visibleBoard);
+      const advice = getPostflopGuidance(hand.street, he, bt, dr, hand.heroIsIP, hand.facingBet);
+      setGtoAdvice(advice);
+    }
+  }, [hand.street, hand.visibleBoard, hand.facingBet, hand.heroCards, hand.heroIsIP, hand.explanation]);
+
+  // ── Hero actions ───────────────────────────────────────────────
+  const heroAct = useCallback((action: string, amount?: number) => {
+    if (!hand.waitingForHero || hand.handComplete) return;
+
+    const h = { ...hand };
+    h.stacks = { ...hand.stacks };
+    h.streetActions = {
+      preflop: [...hand.streetActions.preflop],
+      flop: [...hand.streetActions.flop],
+      turn: [...hand.streetActions.turn],
+      river: [...hand.streetActions.river],
+    };
+    h.actionHistory = [...hand.actionHistory];
+    h.players = hand.players.map((p) => ({ ...p }));
+
+    const heroPlayer = h.players.find((p) => p.position === h.heroPosition);
+
+    if (action === "fold") {
+      if (heroPlayer) {
+        heroPlayer.hasFolded = true;
+        heroPlayer.lastAction = "Fold";
+        heroPlayer.isActive = false;
+      }
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: "Fold", street: h.street });
+      h.heroFolded = true;
+      h.handComplete = true;
+      h.heroWon = false;
+      h.waitingForHero = false;
+      const invested = h.startingStack - h.stacks[h.heroPosition];
+      h.bbWon = -invested;
+
+      // Track preflop accuracy
       setSessionStats((prev) => {
         const newStats = { ...prev };
         newStats.total += 1;
-        newStats.correct += correct ? 1 : 0;
-        newStats.streak = correct ? prev.streak + 1 : 0;
+        const preflopCorrect = h.gtoAction === "Fold";
+        newStats.correct += preflopCorrect ? 1 : 0;
+        newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
         newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
-
-        // Per-position
-        const pos = scenario.heroPosition;
+        newStats.handsLost += 1;
+        newStats.totalBBWon += h.bbWon;
         newStats.perPosition = { ...prev.perPosition };
-        newStats.perPosition[pos] = {
-          correct: prev.perPosition[pos].correct + (correct ? 1 : 0),
-          total: prev.perPosition[pos].total + 1,
+        newStats.perPosition[h.heroPosition] = {
+          correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+          total: prev.perPosition[h.heroPosition].total + 1,
         };
-
-        // Track mistakes
-        if (!correct) {
-          newStats.mistakes = [
-            ...prev.mistakes,
-            {
-              handKey: scenario.handKey,
-              position: scenario.heroPosition,
-              scenario: scenario.rangeScenario,
-              yourAction: action,
-              gtoAction: scenario.gtoAction,
-            },
-          ];
+        if (!preflopCorrect) {
+          newStats.mistakes = [...prev.mistakes, {
+            handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
+            yourAction: "Fold", gtoAction: h.gtoAction,
+          }];
         }
-
         return newStats;
       });
-      setShowResult(true);
-    },
-    [scenario, showResult]
-  );
+
+      setHand(h);
+      return;
+    }
+
+    if (action === "check") {
+      if (heroPlayer) heroPlayer.lastAction = "Check";
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: "Check", street: h.street });
+      h.heroActedThisStreet = true;
+      h.waitingForHero = false;
+
+      if (h.villainActedThisStreet) {
+        // Both checked, move to next street
+        moveToNextStreet(h);
+      }
+      // Otherwise villain will act
+      setHand(h);
+      return;
+    }
+
+    if (action === "call") {
+      const callAmt = h.facingBetAmount - h.heroBetThisStreet;
+      const actualCall = Math.min(callAmt, h.stacks[h.heroPosition]);
+      h.stacks[h.heroPosition] -= actualCall;
+      h.potSize += actualCall;
+      h.heroBetThisStreet += actualCall;
+      if (heroPlayer) {
+        heroPlayer.stack = h.stacks[h.heroPosition];
+        heroPlayer.lastAction = "Call";
+        heroPlayer.currentBet = h.heroBetThisStreet;
+      }
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: "Call", street: h.street });
+      h.heroActedThisStreet = true;
+      h.waitingForHero = false;
+      h.facingBet = false;
+
+      if (h.street === "preflop" && h.spotType === "3-Bet") {
+        // Called preflop 3-bet, move to flop
+        moveToNextStreet(h);
+      } else if (h.villainActedThisStreet) {
+        // Villain bet, hero called, move to next street
+        moveToNextStreet(h);
+      }
+
+      setHand(h);
+      return;
+    }
+
+    if (action === "bet" && amount) {
+      const betSize = Math.min(amount, h.stacks[h.heroPosition]);
+      h.stacks[h.heroPosition] -= betSize;
+      h.potSize += betSize;
+      h.heroBetThisStreet = betSize;
+      if (heroPlayer) {
+        heroPlayer.stack = h.stacks[h.heroPosition];
+        heroPlayer.lastAction = `Bet ${betSize.toFixed(1)}`;
+        heroPlayer.currentBet = betSize;
+      }
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: `Bet ${betSize.toFixed(1)}`, street: h.street });
+      h.heroActedThisStreet = true;
+      h.waitingForHero = false;
+      setHand(h);
+      return;
+    }
+
+    if (action === "raise" && amount) {
+      const raiseTotal = Math.min(amount, h.stacks[h.heroPosition] + h.heroBetThisStreet);
+      const additional = raiseTotal - h.heroBetThisStreet;
+      h.stacks[h.heroPosition] -= additional;
+      h.potSize += additional;
+      h.heroBetThisStreet = raiseTotal;
+      if (heroPlayer) {
+        heroPlayer.stack = h.stacks[h.heroPosition];
+        heroPlayer.lastAction = `Raise ${raiseTotal.toFixed(1)}`;
+        heroPlayer.currentBet = raiseTotal;
+      }
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: h.stacks[h.heroPosition], action: `Raise ${raiseTotal.toFixed(1)}`, street: h.street });
+      h.heroActedThisStreet = true;
+      h.waitingForHero = false;
+      h.facingBet = false;
+
+      if (h.street === "preflop") {
+        // Preflop raise - track accuracy
+        const preflopCorrect = h.gtoAction === "Raise" || h.gtoAction === "Allin";
+        setSessionStats((prev) => {
+          const newStats = { ...prev };
+          newStats.perPosition = { ...prev.perPosition };
+          newStats.perPosition[h.heroPosition] = {
+            correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+            total: prev.perPosition[h.heroPosition].total + 1,
+          };
+          newStats.correct += preflopCorrect ? 1 : 0;
+          newStats.total += 1;
+          newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
+          newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
+          if (!preflopCorrect) {
+            newStats.mistakes = [...prev.mistakes, {
+              handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
+              yourAction: "Raise", gtoAction: h.gtoAction,
+            }];
+          }
+          return newStats;
+        });
+      }
+
+      setHand(h);
+      return;
+    }
+
+    if (action === "allin") {
+      const allinAmt = h.stacks[h.heroPosition];
+      h.stacks[h.heroPosition] = 0;
+      h.potSize += allinAmt;
+      h.heroBetThisStreet += allinAmt;
+      if (heroPlayer) {
+        heroPlayer.stack = 0;
+        heroPlayer.lastAction = "All-in";
+        heroPlayer.currentBet = h.heroBetThisStreet;
+      }
+      h.streetActions[h.street].push({ position: h.heroPosition, stack: 0, action: "All-in", street: h.street });
+      h.heroActedThisStreet = true;
+      h.waitingForHero = false;
+      h.facingBet = false;
+
+      if (h.street === "preflop") {
+        const preflopCorrect = h.gtoAction === "Raise" || h.gtoAction === "Allin";
+        setSessionStats((prev) => {
+          const newStats = { ...prev };
+          newStats.perPosition = { ...prev.perPosition };
+          newStats.perPosition[h.heroPosition] = {
+            correct: prev.perPosition[h.heroPosition].correct + (preflopCorrect ? 1 : 0),
+            total: prev.perPosition[h.heroPosition].total + 1,
+          };
+          newStats.correct += preflopCorrect ? 1 : 0;
+          newStats.total += 1;
+          newStats.streak = preflopCorrect ? prev.streak + 1 : 0;
+          newStats.bestStreak = Math.max(newStats.bestStreak, newStats.streak);
+          if (!preflopCorrect) {
+            newStats.mistakes = [...prev.mistakes, {
+              handKey: h.handKey, position: h.heroPosition, scenario: h.rangeScenario,
+              yourAction: "All-in", gtoAction: h.gtoAction,
+            }];
+          }
+          return newStats;
+        });
+      }
+
+      setHand(h);
+      return;
+    }
+  }, [hand]);
 
   const nextHand = useCallback(() => {
-    setScenario(generateScenario(settings));
-    setShowResult(false);
-  }, [settings]);
+    // If hand is complete but stats haven't been tracked for postflop hands
+    if (hand.handComplete && !hand.heroFolded && hand.street !== "preflop") {
+      setSessionStats((prev) => {
+        const newStats = { ...prev };
+        if (hand.heroWon) {
+          newStats.handsWon += 1;
+        } else {
+          newStats.handsLost += 1;
+        }
+        newStats.totalBBWon += hand.bbWon;
+        // Only count total/correct if not already counted in preflop
+        if (hand.street === "preflop") {
+          // Already counted
+        }
+        return newStats;
+      });
+    }
+
+    const newHand = generateHand(settings);
+    if (settings.startingStreet !== "preflop") {
+      advanceToStreet(newHand, settings.startingStreet);
+    }
+    setHand(newHand);
+    setGtoAdvice("");
+  }, [settings, hand]);
 
   const resetSession = useCallback(() => {
     setSessionStats(emptySessionStats());
   }, []);
 
-  const accuracy = sessionStats.total > 0 ? Math.round((sessionStats.correct / sessionStats.total) * 100) : 0;
-
-  // Build the action history bar text
-  const historySegments = useMemo(() => {
-    const segs: { text: string; highlight?: boolean }[] = [];
-    for (const a of scenario.actionHistory) {
-      segs.push({
-        text: `${a.position} ${a.stack.toFixed(a.stack % 1 === 0 ? 0 : 1)} ${a.action}`,
-      });
-    }
-    segs.push({
-      text: `${scenario.heroPosition} ${settings.stackDepth} Take action`,
-      highlight: true,
-    });
-    return segs;
-  }, [scenario, settings.stackDepth]);
-
-  // Keyboard shortcuts
+  // ── Keyboard shortcuts ─────────────────────────────────────────
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (showResult) {
-        if (e.key === "Enter" || e.key === " " || e.key === "n") {
+      // If hand is complete, N or Enter deals next
+      if (hand.handComplete) {
+        if (e.key === "Enter" || e.key === " " || e.key === "n" || e.key === "N") {
           e.preventDefault();
           nextHand();
         }
         return;
       }
-      if (e.key === "f" || e.key === "1") handleAction("Fold");
-      else if (e.key === "c" || e.key === "2") handleAction("Call");
-      else if (e.key === "r" || e.key === "3") handleAction("Raise");
-      else if (e.key === "a" || e.key === "4") handleAction("Allin");
+
+      if (!hand.waitingForHero) return;
+
+      const key = e.key.toLowerCase();
+
+      if (key === "f" || key === "1") {
+        e.preventDefault();
+        if (hand.facingBet || hand.street === "preflop") heroAct("fold");
+      } else if (key === "c" || key === "2") {
+        e.preventDefault();
+        if (hand.facingBet) {
+          heroAct("call");
+        } else {
+          heroAct("check");
+        }
+      } else if (key === "b" || key === "3") {
+        e.preventDefault();
+        if (!hand.facingBet && hand.street !== "preflop") {
+          const betAmt = Math.round(hand.potSize * 0.5 * 10) / 10;
+          heroAct("bet", betAmt);
+        }
+      } else if (key === "r" || key === "4") {
+        e.preventDefault();
+        if (hand.street === "preflop") {
+          const raiseAmt = hand.spotType === "3-Bet" ? 7.5 : 2.5;
+          heroAct("raise", raiseAmt);
+        } else if (hand.facingBet) {
+          heroAct("raise", hand.facingBetAmount * 2.5);
+        }
+      } else if (key === "a" || key === "5") {
+        e.preventDefault();
+        heroAct("allin");
+      } else if (key === "n") {
+        e.preventDefault();
+        // N for next only when hand is done
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [showResult, handleAction, nextHand]);
+  }, [hand, heroAct, nextHand]);
 
-  // Button labels based on spot type
-  const raiseLabel = scenario.spotType === "3-Bet" ? "3-Bet" : "Raise 2.5";
-  const showCallButton = scenario.spotType === "3-Bet";
+  // ── Derived state ──────────────────────────────────────────────
+  const streetLabel = hand.street.toUpperCase();
+  const canFold = hand.waitingForHero && (hand.facingBet || hand.street === "preflop");
+  const canCheck = hand.waitingForHero && !hand.facingBet && hand.street !== "preflop";
+  const canCall = hand.waitingForHero && hand.facingBet;
+  const canBet = hand.waitingForHero && !hand.facingBet && hand.street !== "preflop";
+  const canRaise = hand.waitingForHero && (hand.street === "preflop" || hand.facingBet);
+
+  // Bet sizing options
+  const potBetSizes = [
+    { label: "33%", mult: 0.33 },
+    { label: "50%", mult: 0.5 },
+    { label: "75%", mult: 0.75 },
+    { label: "100%", mult: 1.0 },
+  ];
 
   return (
     <div className="relative min-h-screen bg-gray-950 flex flex-col select-none">
-      {/* ── Settings Panel (collapsible) ──────────────── */}
+      {/* Settings Panel */}
       <SettingsPanel
         settings={settings}
         onChange={handleSettingsChange}
@@ -885,27 +2096,15 @@ export default function TrainerPage() {
         onToggle={() => setSettingsOpen(!settingsOpen)}
       />
 
-      {/* ── Top bar: action history ──────────────────────────── */}
-      <div className="bg-gray-900/80 border-b border-gray-800 px-4 py-2 flex items-center gap-1 overflow-x-auto text-xs font-mono whitespace-nowrap scrollbar-thin">
-        <span className="text-gray-600 mr-2 text-[10px] font-sans font-semibold uppercase">
-          {scenario.spotType === "3-Bet" ? "3-BET" : "RFI"}
-        </span>
-        {historySegments.map((seg, i) => (
-          <span key={i} className="flex items-center gap-1">
-            {i > 0 && <span className="text-gray-600 mx-1">|</span>}
-            <span className={seg.highlight ? "text-yellow-400 font-bold" : "text-gray-400"}>
-              {seg.text}
-            </span>
-          </span>
-        ))}
-      </div>
+      {/* Action History Bar */}
+      <ActionHistoryBar hand={hand} />
 
-      {/* ── Score bar ────────────────────────────────────────── */}
+      {/* Score bar */}
       <div className="flex items-center justify-between px-4 py-2 bg-gray-900/40">
         <div className="flex items-center gap-3">
           <span className="text-gray-500 text-xs font-semibold uppercase tracking-wider">GTO Trainer</span>
           <span className="text-gray-600 text-xs">|</span>
-          <span className="text-gray-500 text-xs">{scenario.rangeScenario}</span>
+          <span className="text-gray-500 text-xs">{hand.rangeScenario}</span>
         </div>
         <div className="flex items-center gap-4 text-xs">
           {sessionStats.streak >= 3 && (
@@ -920,117 +2119,200 @@ export default function TrainerPage() {
             <span className="text-gray-600">/</span>
             <span className="text-gray-400">{sessionStats.total}</span>
           </div>
-          {sessionStats.total > 0 && (
-            <div className={`font-bold ${accuracy >= 70 ? "text-emerald-400" : accuracy >= 50 ? "text-yellow-400" : "text-red-400"}`}>
-              {accuracy}%
-            </div>
-          )}
+          <div className={`font-bold ${sessionStats.totalBBWon >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+            {sessionStats.totalBBWon >= 0 ? "+" : ""}{sessionStats.totalBBWon.toFixed(1)}bb
+          </div>
         </div>
       </div>
 
-      {/* ── Table area ───────────────────────────────────────── */}
+      {/* Table area */}
       <div className="flex-1 flex items-center justify-center px-4 py-2 relative">
         <PokerTable
-          players={scenario.players}
-          communityCards={scenario.street === "preflop" ? [] : scenario.boardCards.map((c) => c)}
-          heroCards={scenario.heroCards}
-          potSize={scenario.potSize}
-          street={scenario.street}
+          players={hand.players}
+          communityCards={hand.visibleBoard}
+          heroCards={hand.heroCards}
+          potSize={hand.potSize}
+          street={hand.street}
+          streetLabel={streetLabel}
         />
 
-        {/* GTO Result overlay */}
-        {showResult && (
-          <GTOPanel
-            scenario={scenario}
-            correct={lastCorrect}
-            userAction={lastUserAction}
-            onNext={nextHand}
-          />
+        {/* Result overlay */}
+        {hand.handComplete && (
+          <ResultScreen hand={hand} onNext={nextHand} />
         )}
       </div>
 
-      {/* ── Hand info ────────────────────────────────────────── */}
+      {/* Board texture + hand info (postflop) */}
+      {hand.visibleBoard.length > 0 && !hand.handComplete && (
+        <div className="px-4 pb-1">
+          <BoardTexturePanel boardTexture={boardTexture} draws={draws} handEval={handEval} />
+        </div>
+      )}
+
+      {/* Hand info */}
       <div className="text-center pb-1">
         <span className="text-gray-500 text-xs">
           Your hand:{" "}
-          <CardInline card={scenario.heroCards[0]} />{" "}
-          <CardInline card={scenario.heroCards[1]} />
+          <CardInline card={hand.heroCards[0]} />{" "}
+          <CardInline card={hand.heroCards[1]} />
           {"  "}
           <span className="text-gray-600">(</span>
-          <span className="text-white font-bold">{scenario.handKey}</span>
+          <span className="text-white font-bold">{hand.handKey}</span>
           <span className="text-gray-600">)</span>
           {"  "}
           <span className="text-gray-600">at</span>{" "}
-          <span className="text-emerald-400 font-bold">{scenario.heroPosition}</span>
-          {scenario.spotType === "3-Bet" && scenario.raiserPosition && (
+          <span className="text-emerald-400 font-bold">{hand.heroPosition}</span>
+          {hand.raiserPosition && (
             <>
               {"  "}
               <span className="text-gray-600">vs</span>{" "}
-              <span className="text-red-400 font-bold">{scenario.raiserPosition} open</span>
+              <span className="text-red-400 font-bold">{hand.raiserPosition} open</span>
             </>
           )}
+          {"  "}
+          <span className="text-gray-600">|</span>{" "}
+          <span className={`font-semibold ${hand.heroIsIP ? "text-cyan-400" : "text-orange-400"}`}>
+            {hand.heroIsIP ? "In Position" : "Out of Position"}
+          </span>
         </span>
       </div>
 
-      {/* ── Keyboard hint ────────────────────────────────────── */}
+      {/* GTO advice line */}
+      {gtoAdvice && !hand.handComplete && (
+        <div className="text-center pb-1 px-4">
+          <span className="text-gray-600 text-[10px] italic">
+            {gtoAdvice}
+          </span>
+        </div>
+      )}
+
+      {/* Keyboard hints */}
       <div className="text-center pb-1">
         <span className="text-gray-700 text-[9px]">
-          Keys: [F]old [C]all [R]aise [A]ll-in | [Enter] next
+          Keys: [F]old [C]heck/Call [B]et [R]aise [A]ll-in | [N]ext hand
         </span>
       </div>
 
-      {/* ── Action buttons ───────────────────────────────────── */}
+      {/* Action buttons */}
       <div className="bg-gray-900/60 border-t border-gray-800 px-4 py-3">
-        <div className="flex items-center justify-center gap-3 max-w-xl mx-auto">
-          {/* FOLD */}
-          <button
-            onClick={() => handleAction("Fold")}
-            disabled={showResult}
-            className="flex-1 py-3 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
-              bg-gray-700/80 hover:bg-gray-600 text-white border border-gray-600/40
-              disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Fold
-          </button>
+        {hand.waitingForHero && !hand.handComplete ? (
+          <div className="space-y-2 max-w-2xl mx-auto">
+            {/* Main actions row */}
+            <div className="flex items-center justify-center gap-2">
+              {/* FOLD */}
+              {canFold && (
+                <button
+                  onClick={() => heroAct("fold")}
+                  className="flex-1 max-w-[120px] py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
+                    bg-gray-700/80 hover:bg-gray-600 text-white border border-gray-600/40"
+                >
+                  Fold
+                </button>
+              )}
 
-          {/* CALL — shown in 3-bet pots */}
-          {showCallButton && (
+              {/* CHECK */}
+              {canCheck && (
+                <button
+                  onClick={() => heroAct("check")}
+                  className="flex-1 max-w-[120px] py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
+                    bg-gray-600/80 hover:bg-gray-500 text-white border border-gray-500/40"
+                >
+                  Check
+                </button>
+              )}
+
+              {/* CALL */}
+              {canCall && (
+                <button
+                  onClick={() => heroAct("call")}
+                  className="flex-1 max-w-[120px] py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
+                    bg-emerald-700/80 hover:bg-emerald-600 text-white border border-emerald-600/40"
+                >
+                  Call {hand.facingBetAmount > 0 ? (hand.facingBetAmount - hand.heroBetThisStreet).toFixed(1) : ""}
+                </button>
+              )}
+
+              {/* RAISE (preflop) */}
+              {canRaise && hand.street === "preflop" && (
+                <button
+                  onClick={() => heroAct("raise", hand.spotType === "3-Bet" ? 7.5 : 2.5)}
+                  className="flex-1 max-w-[120px] py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
+                    bg-red-700/80 hover:bg-red-600 text-white border border-red-600/40"
+                >
+                  {hand.spotType === "3-Bet" ? "3-Bet" : "Raise 2.5"}
+                </button>
+              )}
+
+              {/* ALL-IN */}
+              <button
+                onClick={() => heroAct("allin")}
+                className="flex-1 max-w-[120px] py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
+                  bg-red-900/80 hover:bg-red-800 text-white border border-red-800/40"
+              >
+                All-In
+              </button>
+            </div>
+
+            {/* Bet sizing row (postflop, not facing bet) */}
+            {canBet && (
+              <div className="flex items-center justify-center gap-2">
+                <span className="text-gray-500 text-xs font-semibold mr-1">BET:</span>
+                {potBetSizes.map((size) => {
+                  const betAmt = Math.round(hand.potSize * size.mult * 10) / 10;
+                  return (
+                    <button
+                      key={size.label}
+                      onClick={() => heroAct("bet", betAmt)}
+                      className="px-3 py-1.5 rounded-lg font-bold text-xs transition-all active:scale-95
+                        bg-orange-700/70 hover:bg-orange-600 text-white border border-orange-600/40"
+                    >
+                      {size.label} ({betAmt.toFixed(1)})
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Raise sizing row (postflop, facing bet) */}
+            {hand.facingBet && hand.street !== "preflop" && (
+              <div className="flex items-center justify-center gap-2">
+                <span className="text-gray-500 text-xs font-semibold mr-1">RAISE:</span>
+                {[
+                  { label: "2.5x", mult: 2.5 },
+                  { label: "3x", mult: 3.0 },
+                ].map((size) => {
+                  const raiseAmt = Math.round(hand.facingBetAmount * size.mult * 10) / 10;
+                  return (
+                    <button
+                      key={size.label}
+                      onClick={() => heroAct("raise", raiseAmt)}
+                      className="px-3 py-1.5 rounded-lg font-bold text-xs transition-all active:scale-95
+                        bg-red-700/70 hover:bg-red-600 text-white border border-red-600/40"
+                    >
+                      {size.label} ({raiseAmt.toFixed(1)})
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ) : !hand.handComplete ? (
+          <div className="text-center">
+            <span className="text-gray-500 text-sm animate-pulse">Opponent is thinking...</span>
+          </div>
+        ) : (
+          <div className="text-center">
             <button
-              onClick={() => handleAction("Call")}
-              disabled={showResult}
-              className="flex-1 py-3 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
-                bg-emerald-700/80 hover:bg-emerald-600 text-white border border-emerald-600/40
-                disabled:opacity-40 disabled:cursor-not-allowed"
+              onClick={nextHand}
+              className="px-8 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all active:scale-95"
             >
-              Call
+              Deal Next Hand
             </button>
-          )}
-
-          {/* RAISE / 3-BET */}
-          <button
-            onClick={() => handleAction("Raise")}
-            disabled={showResult}
-            className="flex-1 py-3 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
-              bg-red-700/80 hover:bg-red-600 text-white border border-red-600/40
-              disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {raiseLabel}
-          </button>
-
-          {/* ALLIN */}
-          <button
-            onClick={() => handleAction("Allin")}
-            disabled={showResult}
-            className="flex-1 py-3 rounded-xl font-bold text-sm uppercase tracking-wide transition-all active:scale-95
-              bg-red-900/80 hover:bg-red-800 text-white border border-red-800/40
-              disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            All-In
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
-      {/* ── Session Stats Panel (collapsible, bottom) ─────── */}
+      {/* Session Stats Panel */}
       <SessionStatsPanel
         stats={sessionStats}
         isOpen={statsOpen}

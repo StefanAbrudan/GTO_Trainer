@@ -16,6 +16,7 @@ export interface PlayerSeat {
   isCurrent: boolean; // current actor
   lastAction?: string; // "Fold","Raise 2.5", etc.
   hasFolded?: boolean;
+  currentBet?: number; // current bet amount this street
 }
 
 export interface PokerTableProps {
@@ -24,6 +25,10 @@ export interface PokerTableProps {
   heroCards: Card[];
   potSize: number;
   street: "preflop" | "flop" | "turn" | "river";
+  heroBet?: number;
+  villainBet?: number;
+  villainPosition?: string;
+  streetLabel?: string;
 }
 
 // ── Card colours (GTO Wizard style) ───────────────────────────────
@@ -42,8 +47,6 @@ const SUIT_TEXT: Record<string, string> = {
 };
 
 // ── Seat positions (percentages for the oval layout) ──────────────
-// 6-max table, positions clockwise from hero at bottom
-// Index order: UTG(top-left), HJ(top-right), CO(right), BTN(bottom-right), SB(bottom-left), BB(left)
 const SEAT_COORDS: Record<string, { top: string; left: string }> = {
   UTG: { top: "8%", left: "30%" },
   HJ: { top: "8%", left: "70%" },
@@ -51,6 +54,16 @@ const SEAT_COORDS: Record<string, { top: string; left: string }> = {
   BTN: { top: "78%", left: "72%" },
   SB: { top: "78%", left: "28%" },
   BB: { top: "44%", left: "4%" },
+};
+
+// Bet chip positions (closer to center than seats)
+const BET_COORDS: Record<string, { top: string; left: string }> = {
+  UTG: { top: "22%", left: "32%" },
+  HJ: { top: "22%", left: "68%" },
+  CO: { top: "42%", left: "80%" },
+  BTN: { top: "62%", left: "68%" },
+  SB: { top: "62%", left: "32%" },
+  BB: { top: "42%", left: "16%" },
 };
 
 // ── Sub-components ────────────────────────────────────────────────
@@ -86,6 +99,22 @@ function CardBack({ size = "md" }: { size?: "sm" | "md" | "lg" }) {
       className={`${dim} rounded-lg bg-gradient-to-br from-blue-900 to-blue-700 border border-blue-500/30 shadow-lg flex items-center justify-center`}
     >
       <div className="w-3/4 h-3/4 rounded-sm border border-blue-400/20 bg-blue-800/60" />
+    </div>
+  );
+}
+
+function BetChip({ amount, position }: { amount: number; position: string }) {
+  const coords = BET_COORDS[position];
+  if (!coords || amount <= 0) return null;
+
+  return (
+    <div
+      className="absolute -translate-x-1/2 -translate-y-1/2 z-15"
+      style={{ top: coords.top, left: coords.left }}
+    >
+      <div className="bg-yellow-600/90 border-2 border-yellow-400/60 rounded-full px-2 py-0.5 shadow-lg">
+        <span className="text-white text-[10px] font-bold">{amount.toFixed(1)}</span>
+      </div>
     </div>
   );
 }
@@ -145,7 +174,11 @@ export default function PokerTable({
   heroCards,
   potSize,
   street,
+  streetLabel,
 }: PokerTableProps) {
+  // Determine how many cards to show based on street for the reveal effect
+  const visibleCommunityCards = communityCards;
+
   return (
     <div className="relative w-full max-w-[720px] mx-auto" style={{ aspectRatio: "16/10" }}>
       {/* Oval table background */}
@@ -157,9 +190,23 @@ export default function PokerTable({
       {/* Table rail / rim highlight */}
       <div className="absolute inset-[14px] rounded-[50%] border border-[#3d5a3d]/30" />
 
+      {/* Street indicator */}
+      {streetLabel && (
+        <div className="absolute top-[18%] left-1/2 -translate-x-1/2 -translate-y-1/2 z-20">
+          <div className={`px-3 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-widest border ${
+            street === "preflop" ? "bg-gray-800/80 border-gray-600/40 text-gray-300" :
+            street === "flop" ? "bg-emerald-900/80 border-emerald-600/40 text-emerald-300" :
+            street === "turn" ? "bg-blue-900/80 border-blue-600/40 text-blue-300" :
+            "bg-purple-900/80 border-purple-600/40 text-purple-300"
+          }`}>
+            {streetLabel}
+          </div>
+        </div>
+      )}
+
       {/* Pot */}
       {potSize > 0 && (
-        <div className="absolute top-[34%] left-1/2 -translate-x-1/2 -translate-y-1/2 z-20">
+        <div className="absolute top-[30%] left-1/2 -translate-x-1/2 -translate-y-1/2 z-20">
           <div className="bg-black/50 backdrop-blur-sm rounded-full px-4 py-1.5 border border-gray-600/30">
             <span className="text-gray-400 text-xs font-semibold">POT </span>
             <span className="text-white text-sm font-bold">{potSize.toFixed(1)}</span>
@@ -169,8 +216,8 @@ export default function PokerTable({
 
       {/* Community cards */}
       <div className="absolute top-[46%] left-1/2 -translate-x-1/2 -translate-y-1/2 flex gap-1.5 z-20">
-        {communityCards.length > 0
-          ? communityCards.map((c, i) => <CardFace key={i} card={c} size="md" />)
+        {visibleCommunityCards.length > 0
+          ? visibleCommunityCards.map((c, i) => <CardFace key={i} card={c} size="md" />)
           : street === "preflop" && (
               <div className="flex gap-1.5">
                 <CardBack size="md" />
@@ -179,6 +226,13 @@ export default function PokerTable({
               </div>
             )}
       </div>
+
+      {/* Bet chips for each player */}
+      {players.map((p) =>
+        p.currentBet && p.currentBet > 0 ? (
+          <BetChip key={`bet-${p.position}`} amount={p.currentBet} position={p.position} />
+        ) : null
+      )}
 
       {/* Player seats */}
       {players.map((p) => (
