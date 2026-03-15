@@ -1460,7 +1460,7 @@ function ResultScreen({
   const split = hand.heroWon === null && hand.showdownReached;
 
   return (
-    <div className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm flex flex-col animate-fade-in">
+    <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex flex-col animate-fade-in">
       {/* Scrollable content area */}
       <div className="flex-1 overflow-y-auto px-4 py-3">
         <div className="bg-gray-900 border border-gray-700 rounded-2xl p-4 max-w-lg mx-auto shadow-2xl">
@@ -2063,19 +2063,8 @@ export default function TrainerPage() {
     }
   }, [hand.street, hand.visibleBoard, hand.facingBet, hand.heroCards, hand.heroIsIP, hand.explanation]);
 
-  // Auto-dismiss feedback banner
-  useEffect(() => {
-    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
-    if (showFeedback) {
-      const delay = settings.speed === "fast" ? 1500 : 3000;
-      feedbackTimerRef.current = setTimeout(() => {
-        setShowFeedback(null);
-      }, delay);
-    }
-    return () => {
-      if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
-    };
-  }, [showFeedback, settings.speed]);
+  // Feedback stays visible until the user takes their next action or clicks to dismiss.
+  // No auto-dismiss timer — the banner clears when heroAct sets a new feedback.
 
   // ── Hero actions ───────────────────────────────────────────────
   const heroAct = useCallback((action: string, amount?: number) => {
@@ -2478,11 +2467,12 @@ export default function TrainerPage() {
           streetLabel={streetLabel}
         />
 
-        {/* Result overlay */}
-        {hand.handComplete && (
-          <ResultScreen hand={hand} onNext={nextHand} actionFeedbacks={actionFeedbacks} />
-        )}
       </div>
+
+      {/* Result overlay — fixed over entire page */}
+      {hand.handComplete && (
+        <ResultScreen hand={hand} onNext={nextHand} actionFeedbacks={actionFeedbacks} />
+      )}
 
       {/* Board texture + hand info (postflop) */}
       {hand.visibleBoard.length > 0 && !hand.handComplete && (
@@ -2647,16 +2637,7 @@ export default function TrainerPage() {
           <div className="text-center">
             <span className="text-gray-500 text-sm animate-pulse">Opponent is thinking...</span>
           </div>
-        ) : (
-          <div className="text-center">
-            <button
-              onClick={nextHand}
-              className="px-8 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all active:scale-95"
-            >
-              Deal Next Hand
-            </button>
-          </div>
-        )}
+        ) : null}
       </div>
 
       {/* Session Stats Panel */}
