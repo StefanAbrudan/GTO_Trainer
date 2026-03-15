@@ -1460,165 +1460,156 @@ function ResultScreen({
   const split = hand.heroWon === null && hand.showdownReached;
 
   return (
-    <div className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center animate-fade-in overflow-y-auto py-4">
-      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-5 max-w-lg w-full mx-4 shadow-2xl">
-        {/* Result header */}
-        <div className="text-center mb-4">
-          <div className={`text-4xl mb-2 ${won ? "text-emerald-400" : hand.heroFolded ? "text-gray-400" : "text-red-400"}`}>
-            {won ? "\u2713" : hand.heroFolded ? "-" : "\u2717"}
-          </div>
-          <h3 className={`text-lg font-black mb-1 ${
-            won ? "text-emerald-400" :
-            hand.heroFolded ? "text-gray-300" :
-            hand.villainFolded ? "text-emerald-400" :
-            "text-red-400"
-          }`}>
-            {hand.heroFolded ? "You folded" :
-             hand.villainFolded ? "Opponent folded - You win!" :
-             won ? "You win at showdown!" :
-             split ? "Split pot" :
-             "You lose at showdown"}
-          </h3>
-        </div>
-
-        {/* Board */}
-        {hand.visibleBoard.length > 0 && (
-          <div className="text-center mb-3">
-            <span className="text-gray-500 text-xs">Board: </span>
-            <BoardInline cards={hand.visibleBoard} />
-          </div>
-        )}
-
-        {/* Hands comparison */}
-        <div className="grid grid-cols-2 gap-3 mb-4">
-          {/* Hero */}
-          <div className={`rounded-lg p-3 border ${won ? "bg-emerald-950/30 border-emerald-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
-            <div className="text-xs text-gray-500 mb-1">Hero ({hand.heroPosition})</div>
-            <div className="flex gap-1 mb-1">
-              <CardInline card={hand.heroCards[0]} /> <CardInline card={hand.heroCards[1]} />
+    <div className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm flex flex-col animate-fade-in">
+      {/* Scrollable content area */}
+      <div className="flex-1 overflow-y-auto px-4 py-3">
+        <div className="bg-gray-900 border border-gray-700 rounded-2xl p-4 max-w-lg mx-auto shadow-2xl">
+          {/* Result header — compact */}
+          <div className="flex items-center gap-3 mb-3">
+            <div className={`text-3xl ${won ? "text-emerald-400" : hand.heroFolded ? "text-gray-400" : hand.villainFolded ? "text-emerald-400" : "text-red-400"}`}>
+              {won ? "\u2713" : hand.heroFolded ? "-" : hand.villainFolded ? "\u2713" : "\u2717"}
             </div>
-            {hand.visibleBoard.length > 0 && (
-              <div className="text-[10px] text-gray-400">{heroEval.rank} - {heroEval.description}</div>
+            <div>
+              <h3 className={`text-base font-black ${
+                won ? "text-emerald-400" :
+                hand.heroFolded ? "text-gray-300" :
+                hand.villainFolded ? "text-emerald-400" :
+                "text-red-400"
+              }`}>
+                {hand.heroFolded ? "You folded" :
+                 hand.villainFolded ? "Opponent folded — You win!" :
+                 won ? "You win at showdown!" :
+                 split ? "Split pot" :
+                 "You lose at showdown"}
+              </h3>
+              <span className={`text-sm font-black ${
+                hand.bbWon > 0 ? "text-emerald-400" :
+                hand.bbWon < 0 ? "text-red-400" :
+                "text-gray-400"
+              }`}>
+                {hand.bbWon > 0 ? "+" : ""}{hand.bbWon.toFixed(1)}bb
+              </span>
+            </div>
+          </div>
+
+          {/* Board — inline */}
+          {hand.visibleBoard.length > 0 && (
+            <div className="mb-2">
+              <span className="text-gray-500 text-xs">Board: </span>
+              <BoardInline cards={hand.visibleBoard} />
+            </div>
+          )}
+
+          {/* Hands comparison — compact row */}
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <div className={`rounded-lg px-3 py-2 border ${won ? "bg-emerald-950/30 border-emerald-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
+              <div className="text-[10px] text-gray-500">Hero ({hand.heroPosition})</div>
+              <div className="flex gap-1 items-center">
+                <CardInline card={hand.heroCards[0]} /> <CardInline card={hand.heroCards[1]} />
+                {hand.visibleBoard.length > 0 && (
+                  <span className="text-[9px] text-gray-400 ml-1">{heroEval.description}</span>
+                )}
+              </div>
+            </div>
+            {hand.showdownReached ? (
+              <div className={`rounded-lg px-3 py-2 border ${!won && !hand.heroFolded ? "bg-red-950/30 border-red-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
+                <div className="text-[10px] text-gray-500">Villain ({hand.villainPosition})</div>
+                <div className="flex gap-1 items-center">
+                  <CardInline card={hand.villainCards[0]} /> <CardInline card={hand.villainCards[1]} />
+                  {hand.visibleBoard.length > 0 && (
+                    <span className="text-[9px] text-gray-400 ml-1">{villainEval.description}</span>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg px-3 py-2 border bg-gray-800/60 border-gray-700/40">
+                <div className="text-[10px] text-gray-500">Villain ({hand.villainPosition})</div>
+                <div className="text-gray-600 text-xs">{hand.villainFolded ? "Folded" : "Mucked"}</div>
+              </div>
             )}
           </div>
 
-          {/* Villain */}
-          {hand.showdownReached && (
-            <div className={`rounded-lg p-3 border ${!won && !hand.heroFolded ? "bg-red-950/30 border-red-800/40" : "bg-gray-800/60 border-gray-700/40"}`}>
-              <div className="text-xs text-gray-500 mb-1">Villain ({hand.villainPosition})</div>
-              <div className="flex gap-1 mb-1">
-                <CardInline card={hand.villainCards[0]} /> <CardInline card={hand.villainCards[1]} />
-              </div>
-              {hand.visibleBoard.length > 0 && (
-                <div className="text-[10px] text-gray-400">{villainEval.rank} - {villainEval.description}</div>
-              )}
-            </div>
-          )}
-          {!hand.showdownReached && (
-            <div className="rounded-lg p-3 border bg-gray-800/60 border-gray-700/40">
-              <div className="text-xs text-gray-500 mb-1">Villain ({hand.villainPosition})</div>
-              <div className="text-gray-600 text-xs">{hand.villainFolded ? "Folded" : "Mucked"}</div>
-            </div>
-          )}
-        </div>
-
-        {/* EV result */}
-        <div className={`rounded-lg p-3 mb-4 text-center border ${
-          hand.bbWon > 0 ? "bg-emerald-950/30 border-emerald-800/40" :
-          hand.bbWon < 0 ? "bg-red-950/30 border-red-800/40" :
-          "bg-gray-800/60 border-gray-700/40"
-        }`}>
-          <span className={`text-lg font-black ${
-            hand.bbWon > 0 ? "text-emerald-400" :
-            hand.bbWon < 0 ? "text-red-400" :
-            "text-gray-300"
-          }`}>
-            {hand.bbWon > 0 ? "+" : ""}{hand.bbWon.toFixed(1)}bb
-          </span>
-          <div className="text-xs text-gray-500 mt-0.5">
-            {hand.bbWon > 0 ? "Won this hand" : hand.bbWon < 0 ? "Lost this hand" : "Break even"}
-          </div>
-        </div>
-
-        {/* Preflop GTO info */}
-        <div className="bg-gray-800/60 rounded-lg p-3 mb-4 space-y-2">
-          <div className="text-xs text-gray-500 font-semibold">{hand.rangeScenario}</div>
-          <div className="text-xs text-gray-300">{hand.explanation}</div>
-          <div className="flex items-center gap-2">
-            <span className="text-gray-400 text-xs w-12 text-right">Raise</span>
-            <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
-              <div className="h-full bg-red-500 rounded-full" style={{ width: `${hand.gtoFrequency}%` }} />
-            </div>
-            <span className="text-white text-xs font-bold w-10">{hand.gtoFrequency}%</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-gray-400 text-xs w-12 text-right">Fold</span>
-            <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
-              <div className="h-full bg-gray-500 rounded-full" style={{ width: `${hand.foldFrequency}%` }} />
-            </div>
-            <span className="text-white text-xs font-bold w-10">{Math.round(hand.foldFrequency)}%</span>
-          </div>
-        </div>
-
-        {/* Mini range grid */}
-        {Object.keys(hand.rangeGrid).length > 0 && (
-          <div className="mb-4">
-            <div className="text-xs text-gray-500 font-semibold mb-2">
-              Full Range ({hand.heroPosition} {hand.spotType === "3-Bet" ? "3-Bet" : "RFI"})
-            </div>
-            <div className="flex justify-center">
-              <MiniRangeGrid
-                grid={hand.rangeGrid}
-                highlightHand={hand.handKey}
-                correct={hand.heroWon === true || hand.villainFolded}
-              />
-            </div>
-            <div className="flex gap-2 items-center justify-center mt-2 text-[9px] text-gray-500">
-              {[0, 20, 50, 80, 100].map((f) => (
-                <div key={f} className="flex items-center gap-0.5">
-                  <div className={`w-2.5 h-2.5 rounded-sm ${getFrequencyColor(f)}`} />
-                  <span>{f}%</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Action Log with Feedback */}
-        {actionFeedbacks.length > 0 && (
-          <div className="mb-4">
-            <div className="text-xs text-gray-500 font-semibold mb-2 uppercase tracking-wider">Action Log with GTO Feedback</div>
-            <div className="max-h-40 overflow-y-auto space-y-1 scrollbar-thin">
-              {actionFeedbacks.map((fb, i) => {
-                const cfg = RATING_CONFIG[fb.rating];
-                return (
-                  <div
-                    key={i}
-                    className={`flex items-start gap-2 rounded-lg px-3 py-1.5 border-l-2 ${cfg.border} ${cfg.bg}`}
-                  >
-                    <div className="flex flex-col items-center min-w-[32px]">
-                      <span className={`text-sm font-black leading-none ${cfg.iconColor}`}>{cfg.icon}</span>
-                      <span className={`text-[7px] font-black uppercase ${cfg.labelColor}`}>{cfg.label}</span>
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 text-[10px]">
-                        <span className="text-gray-500 uppercase font-bold">{fb.street}</span>
-                        <span className="text-gray-400">You: <span className="text-white font-semibold">{fb.yourAction}</span></span>
-                        <span className="text-gray-600">|</span>
-                        <span className="text-gray-400">GTO: <span className={`font-semibold ${cfg.gtoColor}`}>{fb.gtoAction}</span></span>
+          {/* Action Log with Feedback — this is what the user cares about most */}
+          {actionFeedbacks.length > 0 && (
+            <div className="mb-3">
+              <div className="text-[10px] text-gray-500 font-semibold mb-1.5 uppercase tracking-wider">Action Review</div>
+              <div className="space-y-1">
+                {actionFeedbacks.map((fb, i) => {
+                  const cfg = RATING_CONFIG[fb.rating];
+                  return (
+                    <div
+                      key={i}
+                      className={`flex items-center gap-2 rounded-lg px-3 py-1.5 border-l-2 ${cfg.border} ${cfg.bg}`}
+                    >
+                      <span className={`text-xs font-black ${cfg.iconColor} min-w-[50px] text-center`}>
+                        {cfg.icon} {cfg.label}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 text-[10px]">
+                          <span className="text-gray-500 uppercase font-bold">{fb.street}</span>
+                          <span className="text-white font-semibold">{fb.yourAction}</span>
+                          <span className="text-gray-600">→</span>
+                          <span className={`font-semibold ${cfg.gtoColor}`}>GTO: {fb.gtoAction}</span>
+                        </div>
                       </div>
-                      <p className="text-[9px] text-gray-500 leading-tight mt-0.5">{fb.explanation}</p>
                     </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Preflop GTO info — compact */}
+          <div className="bg-gray-800/60 rounded-lg p-2.5 mb-3 space-y-1.5">
+            <div className="text-[10px] text-gray-500 font-semibold">{hand.rangeScenario}</div>
+            <div className="text-[10px] text-gray-300">{hand.explanation}</div>
+            <div className="flex items-center gap-2">
+              <span className="text-gray-400 text-[10px] w-10 text-right">Raise</span>
+              <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                <div className="h-full bg-red-500 rounded-full" style={{ width: `${hand.gtoFrequency}%` }} />
+              </div>
+              <span className="text-white text-[10px] font-bold w-8">{hand.gtoFrequency}%</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-gray-400 text-[10px] w-10 text-right">Fold</span>
+              <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                <div className="h-full bg-gray-500 rounded-full" style={{ width: `${hand.foldFrequency}%` }} />
+              </div>
+              <span className="text-white text-[10px] font-bold w-8">{Math.round(hand.foldFrequency)}%</span>
             </div>
           </div>
-        )}
 
+          {/* Mini range grid — collapsed by default */}
+          {Object.keys(hand.rangeGrid).length > 0 && (
+            <details className="mb-3">
+              <summary className="text-[10px] text-gray-500 font-semibold cursor-pointer hover:text-gray-300 transition-colors">
+                Show Range Grid ({hand.heroPosition} {hand.spotType === "3-Bet" ? "3-Bet" : "RFI"})
+              </summary>
+              <div className="mt-2 flex justify-center">
+                <MiniRangeGrid
+                  grid={hand.rangeGrid}
+                  highlightHand={hand.handKey}
+                  correct={hand.heroWon === true || hand.villainFolded}
+                />
+              </div>
+              <div className="flex gap-2 items-center justify-center mt-2 text-[9px] text-gray-500">
+                {[0, 20, 50, 80, 100].map((f) => (
+                  <div key={f} className="flex items-center gap-0.5">
+                    <div className={`w-2.5 h-2.5 rounded-sm ${getFrequencyColor(f)}`} />
+                    <span>{f}%</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      </div>
+
+      {/* Sticky bottom button */}
+      <div className="shrink-0 px-4 pb-3 pt-2 bg-gradient-to-t from-black/90 to-transparent">
         <button
           onClick={onNext}
-          className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all active:scale-95"
+          className="w-full max-w-lg mx-auto block py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all active:scale-95"
         >
           Deal Next Hand
         </button>
