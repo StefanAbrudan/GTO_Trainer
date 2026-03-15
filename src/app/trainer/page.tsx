@@ -401,6 +401,107 @@ function analyzeDraws(holeCards: Card[], boardCards: Card[]): string[] {
   return draws;
 }
 
+// ── Action Feedback ─────────────────────────────────────────────
+interface ActionFeedback {
+  correct: boolean;
+  yourAction: string;
+  gtoAction: string;
+  explanation: string;
+  street: Street;
+  timestamp: number;
+}
+
+function getGTORecommendation(
+  street: Street,
+  hand: {
+    gtoAction: string;
+    gtoFrequency: number;
+    heroIsIP: boolean;
+    facingBet: boolean;
+    facingBetAmount: number;
+    potSize: number;
+    heroCards: [Card, Card];
+    visibleBoard: Card[];
+  },
+): { action: string; explanation: string } {
+  if (street === "preflop") {
+    if (hand.gtoFrequency >= 50) {
+      return { action: hand.gtoAction, explanation: `GTO preflop: ${hand.gtoAction} at ${hand.gtoFrequency}% frequency.` };
+    } else {
+      return { action: "Fold", explanation: `GTO preflop: Fold (raise frequency only ${hand.gtoFrequency}%).` };
+    }
+  }
+
+  // Postflop
+  const handEval = evaluateHand(hand.heroCards, hand.visibleBoard);
+  const draws = analyzeDraws(hand.heroCards, hand.visibleBoard);
+  const hasFlushDraw = draws.some((d) => d.toLowerCase().includes("flush draw"));
+  const hasOESD = draws.some((d) => d.toLowerCase().includes("open-ended"));
+  const hasDraws = hasFlushDraw || hasOESD;
+
+  if (hand.facingBet) {
+    // Facing a bet
+    if (handEval.strength >= 5) {
+      return { action: "Raise", explanation: `Monster hand (${handEval.description}). Raise for value.` };
+    }
+    if (handEval.strength >= 3) {
+      return { action: "Call", explanation: `Strong hand (${handEval.description}). Call to continue.` };
+    }
+    if (handEval.strength >= 2 && hasDraws) {
+      return { action: "Call", explanation: `${handEval.description} with draws (${draws.join(", ")}). Call with equity.` };
+    }
+    if (hasFlushDraw || hasOESD) {
+      return { action: "Call", explanation: `Drawing hand (${draws.join(", ")}). Call if getting odds.` };
+    }
+    if (handEval.strength < 1.5 && !hasDraws) {
+      return { action: "Fold", explanation: `Weak hand (${handEval.description}), no draws. Fold vs bet.` };
+    }
+    // Medium hands default call
+    return { action: "Call", explanation: `Medium hand (${handEval.description}). Calling is reasonable.` };
+  }
+
+  // Not facing a bet
+  if (handEval.strength >= 4) {
+    return { action: "Bet 66-75% pot", explanation: `Strong hand (${handEval.description}). Value bet for protection and value.` };
+  }
+  if (handEval.strength >= 2.5 && hand.heroIsIP) {
+    return { action: "Bet 33-50% pot", explanation: `Decent hand (${handEval.description}) in position. Thin value bet.` };
+  }
+  if (handEval.strength >= 2.5 && !hand.heroIsIP) {
+    return { action: "Check", explanation: `Decent hand (${handEval.description}) OOP. Prefer checking to control pot.` };
+  }
+  if ((hasFlushDraw || hasOESD) && handEval.strength < 2.5) {
+    return { action: "Bet 50% pot", explanation: `Drawing hand (${draws.join(", ")}). Semi-bluff opportunity.` };
+  }
+  if (handEval.strength < 1 && !hasDraws) {
+    return { action: "Check", explanation: `Weak hand (${handEval.description}), no draws. Give up.` };
+  }
+  if (handEval.strength < 1 && hasDraws) {
+    return { action: "Check", explanation: `Weak hand with draws (${draws.join(", ")}). Check with equity.` };
+  }
+  return { action: "Check", explanation: `Marginal hand (${handEval.description}). Check is standard.` };
+}
+
+function isActionCorrect(heroAction: string, gtoRec: string): boolean {
+  const ha = heroAction.toLowerCase();
+  const gr = gtoRec.toLowerCase();
+
+  if (ha === "fold" && gr === "fold") return true;
+  if (ha === "check" && gr === "check") return true;
+  if (ha === "call" && gr === "call") return true;
+
+  // Bet/raise actions match bet/raise recommendations
+  const heroIsBetOrRaise = ha.startsWith("bet") || ha.startsWith("raise") || ha === "all-in";
+  const gtoIsBetOrRaise = gr.startsWith("bet") || gr.startsWith("raise");
+
+  if (heroIsBetOrRaise && gtoIsBetOrRaise) return true;
+
+  // All-in matches raise/bet for strong hands
+  if (ha === "all-in" && gtoIsBetOrRaise) return true;
+
+  return false;
+}
+
 // ── Scenario Types ──────────────────────────────────────────────
 interface ActionEntry {
   position: string;
@@ -1192,13 +1293,53 @@ function BoardTexturePanel({ boardTexture, draws, handEval }: {
   );
 }
 
+// ── Feedback Banner ─────────────────────────────────────────────────
+function FeedbackBanner({
+  feedback,
+  onDismiss,
+}: {
+  feedback: ActionFeedback;
+  onDismiss: () => void;
+}) {
+  const borderColor = feedback.correct ? "border-emerald-500" : "border-red-500";
+  const bgColor = feedback.correct ? "bg-emerald-950/60" : "bg-red-950/60";
+  const icon = feedback.correct ? "\u2713" : "\u2717";
+  const iconColor = feedback.correct ? "text-emerald-400" : "text-red-400";
+
+  return (
+    <div
+      onClick={onDismiss}
+      className={`mx-4 mb-1 rounded-xl border-l-4 ${borderColor} ${bgColor} px-4 py-3 cursor-pointer transition-all animate-fade-in`}
+    >
+      <div className="flex items-start gap-3">
+        <span className={`text-2xl font-black ${iconColor} leading-none mt-0.5`}>{icon}</span>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-3 flex-wrap mb-1">
+            <span className="text-xs text-gray-400">
+              Your action: <span className="text-white font-bold">{feedback.yourAction}</span>
+            </span>
+            <span className="text-gray-600 text-xs">|</span>
+            <span className="text-xs text-gray-400">
+              GTO recommends: <span className={`font-bold ${feedback.correct ? "text-emerald-400" : "text-yellow-400"}`}>{feedback.gtoAction}</span>
+            </span>
+          </div>
+          <p className="text-[11px] text-gray-400 leading-snug">{feedback.explanation}</p>
+          <span className="text-[9px] text-gray-600 uppercase tracking-wider">{feedback.street} &middot; click to dismiss</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Result Screen ───────────────────────────────────────────────────
 function ResultScreen({
   hand,
   onNext,
+  actionFeedbacks,
 }: {
   hand: HandState;
   onNext: () => void;
+  actionFeedbacks: ActionFeedback[];
 }) {
   const heroEval = evaluateHand(hand.heroCards, hand.visibleBoard);
   const villainEval = evaluateHand(hand.villainCards, hand.visibleBoard);
@@ -1324,6 +1465,36 @@ function ResultScreen({
                 <div key={f} className="flex items-center gap-0.5">
                   <div className={`w-2.5 h-2.5 rounded-sm ${getFrequencyColor(f)}`} />
                   <span>{f}%</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Action Log with Feedback */}
+        {actionFeedbacks.length > 0 && (
+          <div className="mb-4">
+            <div className="text-xs text-gray-500 font-semibold mb-2 uppercase tracking-wider">Action Log with GTO Feedback</div>
+            <div className="max-h-40 overflow-y-auto space-y-1 scrollbar-thin">
+              {actionFeedbacks.map((fb, i) => (
+                <div
+                  key={i}
+                  className={`flex items-start gap-2 rounded-lg px-3 py-1.5 border-l-2 ${
+                    fb.correct ? "border-emerald-500 bg-emerald-950/20" : "border-red-500 bg-red-950/20"
+                  }`}
+                >
+                  <span className={`text-sm font-black leading-none mt-0.5 ${fb.correct ? "text-emerald-400" : "text-red-400"}`}>
+                    {fb.correct ? "\u2713" : "\u2717"}
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 text-[10px]">
+                      <span className="text-gray-500 uppercase font-bold">{fb.street}</span>
+                      <span className="text-gray-400">You: <span className="text-white font-semibold">{fb.yourAction}</span></span>
+                      <span className="text-gray-600">|</span>
+                      <span className="text-gray-400">GTO: <span className={`font-semibold ${fb.correct ? "text-emerald-400" : "text-yellow-400"}`}>{fb.gtoAction}</span></span>
+                    </div>
+                    <p className="text-[9px] text-gray-500 leading-tight mt-0.5">{fb.explanation}</p>
+                  </div>
                 </div>
               ))}
             </div>
@@ -1475,7 +1646,10 @@ export default function TrainerPage() {
   const [hand, setHand] = useState<HandState>(() => generateHand(DEFAULT_SETTINGS));
   const [sessionStats, setSessionStats] = useState<SessionStats>(emptySessionStats);
   const [gtoAdvice, setGtoAdvice] = useState<string>("");
+  const [actionFeedbacks, setActionFeedbacks] = useState<ActionFeedback[]>([]);
+  const [showFeedback, setShowFeedback] = useState<ActionFeedback | null>(null);
   const opponentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Compute board analysis
   const boardTexture = useMemo(() => analyzeBoardTexture(hand.visibleBoard), [hand.visibleBoard]);
@@ -1493,6 +1667,8 @@ export default function TrainerPage() {
       }
       setHand(newHand);
       setGtoAdvice("");
+      setActionFeedbacks([]);
+      setShowFeedback(null);
     }
   }, [hand]);
 
@@ -1781,6 +1957,20 @@ export default function TrainerPage() {
     }
   }, [hand.street, hand.visibleBoard, hand.facingBet, hand.heroCards, hand.heroIsIP, hand.explanation]);
 
+  // Auto-dismiss feedback banner
+  useEffect(() => {
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    if (showFeedback) {
+      const delay = settings.speed === "fast" ? 1500 : 3000;
+      feedbackTimerRef.current = setTimeout(() => {
+        setShowFeedback(null);
+      }, delay);
+    }
+    return () => {
+      if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    };
+  }, [showFeedback, settings.speed]);
+
   // ── Hero actions ───────────────────────────────────────────────
   const heroAct = useCallback((action: string, amount?: number) => {
     if (!hand.waitingForHero || hand.handComplete) return;
@@ -1797,6 +1987,36 @@ export default function TrainerPage() {
     h.players = hand.players.map((p) => ({ ...p }));
 
     const heroPlayer = h.players.find((p) => p.position === h.heroPosition);
+
+    // Compute GTO recommendation and feedback for this action
+    const gtoRec = getGTORecommendation(h.street, {
+      gtoAction: h.gtoAction,
+      gtoFrequency: h.gtoFrequency,
+      heroIsIP: h.heroIsIP,
+      facingBet: h.facingBet,
+      facingBetAmount: h.facingBetAmount,
+      potSize: h.potSize,
+      heroCards: h.heroCards,
+      visibleBoard: h.visibleBoard,
+    });
+
+    // Determine display name for the hero's action
+    let heroActionDisplay = action.charAt(0).toUpperCase() + action.slice(1);
+    if (action === "bet" && amount) heroActionDisplay = `Bet ${amount.toFixed(1)}`;
+    if (action === "raise" && amount) heroActionDisplay = `Raise ${amount.toFixed(1)}`;
+    if (action === "allin") heroActionDisplay = "All-in";
+
+    const actionCorrect = isActionCorrect(heroActionDisplay, gtoRec.action);
+    const feedback: ActionFeedback = {
+      correct: actionCorrect,
+      yourAction: heroActionDisplay,
+      gtoAction: gtoRec.action,
+      explanation: gtoRec.explanation,
+      street: h.street,
+      timestamp: Date.now(),
+    };
+    setActionFeedbacks((prev) => [...prev, feedback]);
+    setShowFeedback(feedback);
 
     if (action === "fold") {
       if (heroPlayer) {
@@ -2012,6 +2232,8 @@ export default function TrainerPage() {
     }
     setHand(newHand);
     setGtoAdvice("");
+    setActionFeedbacks([]);
+    setShowFeedback(null);
   }, [settings, hand]);
 
   const resetSession = useCallback(() => {
@@ -2138,7 +2360,7 @@ export default function TrainerPage() {
 
         {/* Result overlay */}
         {hand.handComplete && (
-          <ResultScreen hand={hand} onNext={nextHand} />
+          <ResultScreen hand={hand} onNext={nextHand} actionFeedbacks={actionFeedbacks} />
         )}
       </div>
 
@@ -2147,6 +2369,11 @@ export default function TrainerPage() {
         <div className="px-4 pb-1">
           <BoardTexturePanel boardTexture={boardTexture} draws={draws} handEval={handEval} />
         </div>
+      )}
+
+      {/* Feedback Banner */}
+      {showFeedback && !hand.handComplete && (
+        <FeedbackBanner feedback={showFeedback} onDismiss={() => setShowFeedback(null)} />
       )}
 
       {/* Hand info */}
